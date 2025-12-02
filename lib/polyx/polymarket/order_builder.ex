@@ -204,13 +204,15 @@ defmodule Polyx.Polymarket.OrderBuilder do
     # - makerAmount = USDC to pay = size × price
     # - takerAmount = tokens to receive = size
     #
-    # Example: Buy 5.01 tokens at $0.998 each
-    # - takerAmount = 5.01 tokens = 5010000 (6 decimals)
-    # - makerAmount = 5.01 × 0.998 = 4.99998 USDC = 4999980 (6 decimals)
+    # API precision requirements for BUY:
+    # - makerAmount (USDC): max 4 decimals
+    # - takerAmount (tokens): max 2 decimals
     #
-    # Rounding: round down to 2 decimal places for amounts
-    token_amount = (round_down_decimals(size, 2) * 1_000_000) |> trunc()
-    usdc_amount = (round_down_decimals(size * price, 5) * 1_000_000) |> trunc()
+    # IMPORTANT: Round size first, then calculate USDC based on rounded size
+    # to ensure maker_amount / taker_amount = price (API validation requirement)
+    rounded_size = round_down_decimals(size, 2)
+    token_amount = (rounded_size * 1_000_000) |> trunc()
+    usdc_amount = (round_down_decimals(rounded_size * price, 4) * 1_000_000) |> trunc()
 
     {usdc_amount, token_amount}
   end
@@ -221,11 +223,14 @@ defmodule Polyx.Polymarket.OrderBuilder do
     # - makerAmount = tokens to give = size
     # - takerAmount = USDC to receive = size × price
     #
-    # Example: Sell 5.01 tokens at $0.998 each
-    # - makerAmount = 5.01 tokens = 5010000 (6 decimals)
-    # - takerAmount = 5.01 × 0.998 = 4.99998 USDC = 4999980 (6 decimals)
-    token_amount = (round_down_decimals(size, 2) * 1_000_000) |> trunc()
-    usdc_amount = (round_down_decimals(size * price, 5) * 1_000_000) |> trunc()
+    # API precision requirements for SELL:
+    # - makerAmount (tokens): max 2 decimals
+    # - takerAmount (USDC): max 4 decimals
+    #
+    # IMPORTANT: Round size first, then calculate USDC based on rounded size
+    rounded_size = round_down_decimals(size, 2)
+    token_amount = (rounded_size * 1_000_000) |> trunc()
+    usdc_amount = (round_down_decimals(rounded_size * price, 4) * 1_000_000) |> trunc()
 
     {token_amount, usdc_amount}
   end

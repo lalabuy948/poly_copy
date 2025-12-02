@@ -37,8 +37,15 @@ defmodule PolyxWeb.HomeLive do
      |> assign(:account_summary, account_summary)
      |> assign(:feed_filter, nil)
      |> assign(:editing_user, nil)
+     |> assign(:show_archived, false)
      |> stream(:copy_trades, copy_trades)
      |> stream(:live_feed, live_feed)}
+  end
+
+  @impl true
+  def handle_event("validate_add_user", params, socket) do
+    # Preserve form values during re-renders
+    {:noreply, assign(socket, :add_user_form, to_form(params))}
   end
 
   @impl true
@@ -106,6 +113,11 @@ defmodule PolyxWeb.HomeLive do
   end
 
   @impl true
+  def handle_event("toggle_archived", _params, socket) do
+    {:noreply, assign(socket, :show_archived, !socket.assigns.show_archived)}
+  end
+
+  @impl true
   def handle_event("restore_user", %{"address" => address}, socket) do
     case CopyTrading.restore_user(address) do
       {:ok, _user} ->
@@ -121,6 +133,25 @@ defmodule PolyxWeb.HomeLive do
 
       {:error, _reason} ->
         {:noreply, put_flash(socket, :error, "Failed to restore user")}
+    end
+  end
+
+  @impl true
+  def handle_event("delete_user", %{"address" => address}, socket) do
+    case CopyTrading.delete_user(address) do
+      {:ok, _user} ->
+        archived_users = CopyTrading.list_archived_users()
+
+        {:noreply,
+         socket
+         |> assign(:archived_users, archived_users)
+         |> put_flash(:info, "User permanently deleted")}
+
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "User not found or not archived")}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Failed to delete user")}
     end
   end
 
@@ -240,6 +271,20 @@ defmodule PolyxWeb.HomeLive do
   end
 
   @impl true
+  def handle_event("delete_all_failed", _params, socket) do
+    case CopyTrading.delete_all_failed_copy_trades() do
+      {:ok, 0} ->
+        {:noreply, put_flash(socket, :info, "No failed trades to delete")}
+
+      {:ok, count} ->
+        {:noreply, put_flash(socket, :info, "Deleted #{count} failed trade(s)")}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Failed to delete trades")}
+    end
+  end
+
+  @impl true
   def handle_info({:user_tracked, user_info}, socket) do
     {:noreply, assign(socket, :tracked_users, [user_info | socket.assigns.tracked_users])}
   end
@@ -319,9 +364,18 @@ defmodule PolyxWeb.HomeLive do
     # Show flash based on trade status
     socket =
       case trade.status do
-        :executed -> put_flash(socket, :info, "Trade copied successfully")
-        :failed -> put_flash(socket, :error, "Copy trade failed: #{Map.get(trade, :error_message, "Unknown error")}")
-        _ -> socket
+        :executed ->
+          put_flash(socket, :info, "Trade copied successfully")
+
+        :failed ->
+          put_flash(
+            socket,
+            :error,
+            "Copy trade failed: #{Map.get(trade, :error_message, "Unknown error")}"
+          )
+
+        _ ->
+          socket
       end
 
     {:noreply, socket}
@@ -334,7 +388,19 @@ defmodule PolyxWeb.HomeLive do
 
   @impl true
   def handle_info({:copy_trade_deleted, trade}, socket) do
-    {:noreply, stream_delete(socket, :copy_trades, trade)}
+    # Remove from copied_trade_ids so the trade shows "Copy" button again in live feed
+    copied_ids = MapSet.delete(socket.assigns.copied_trade_ids, trade.original_trade_id)
+
+    {:noreply,
+     socket
+     |> assign(:copied_trade_ids, copied_ids)
+     |> stream_delete(:copy_trades, trade)}
+  end
+
+  @impl true
+  def handle_info({:user_deleted, _user_info}, socket) do
+    archived_users = CopyTrading.list_archived_users()
+    {:noreply, assign(socket, :archived_users, archived_users)}
   end
 
   @impl true
@@ -499,7 +565,12 @@ defmodule PolyxWeb.HomeLive do
 
                 <div class="p-5">
                   <%!-- Add User Form --%>
-                  <form phx-submit="add_user" id="add-user-form" class="flex gap-2 mb-5">
+                  <form
+                    phx-submit="add_user"
+                    phx-change="validate_add_user"
+                    id="add-user-form"
+                    class="flex gap-2 mb-5"
+                  >
                     <div class="flex-1 relative">
                       <input
                         type="text"
@@ -545,7 +616,8 @@ defmodule PolyxWeb.HomeLive do
                       class={[
                         "group flex items-center justify-between p-3 rounded-xl border transition-colors",
                         @feed_filter == user.address && "bg-primary/5 border-primary/30",
-                        @feed_filter != user.address && "bg-base-100 border-base-300/50 hover:border-base-300"
+                        @feed_filter != user.address &&
+                          "bg-base-100 border-base-300/50 hover:border-base-300"
                       ]}
                     >
                       <%= if @editing_user == user.address do %>
@@ -600,7 +672,8 @@ defmodule PolyxWeb.HomeLive do
                           <div class={[
                             "w-10 h-10 rounded-xl flex items-center justify-center",
                             @feed_filter == user.address && "bg-primary/20",
-                            @feed_filter != user.address && "bg-gradient-to-br from-primary/20 to-secondary/20"
+                            @feed_filter != user.address &&
+                              "bg-gradient-to-br from-primary/20 to-secondary/20"
                           ]}>
                             <span class="text-sm font-bold text-primary">
                               {user.label |> String.slice(0, 2) |> String.upcase()}
@@ -644,11 +717,14 @@ defmodule PolyxWeb.HomeLive do
                             type="button"
                             phx-click="filter_feed"
                             phx-value-address={user.address}
-                            title={if @feed_filter == user.address, do: "Show all", else: "Filter feed"}
+                            title={
+                              if @feed_filter == user.address, do: "Show all", else: "Filter feed"
+                            }
                             class={[
                               "p-2 rounded-lg transition-all",
                               @feed_filter == user.address && "text-primary bg-primary/10",
-                              @feed_filter != user.address && "text-base-content/30 hover:text-info hover:bg-info/10 opacity-0 group-hover:opacity-100"
+                              @feed_filter != user.address &&
+                                "text-base-content/30 hover:text-info hover:bg-info/10 opacity-0 group-hover:opacity-100"
                             ]}
                           >
                             <.icon name="hero-funnel" class="size-4" />
@@ -670,16 +746,24 @@ defmodule PolyxWeb.HomeLive do
               </div>
 
               <%!-- Archived Users (collapsible) --%>
-              <details :if={@archived_users != []} class="group">
-                <summary class="flex items-center gap-2 cursor-pointer text-sm text-base-content/50 hover:text-base-content/70 transition-colors">
+              <div :if={@archived_users != []}>
+                <button
+                  type="button"
+                  phx-click="toggle_archived"
+                  class="flex items-center gap-2 cursor-pointer text-sm text-base-content/50 hover:text-base-content/70 transition-colors"
+                >
                   <.icon
                     name="hero-chevron-right"
-                    class="size-4 transition-transform group-open:rotate-90"
+                    class={
+                      if @show_archived,
+                        do: "size-4 transition-transform rotate-90",
+                        else: "size-4 transition-transform"
+                    }
                   />
                   <.icon name="hero-archive-box" class="size-4" />
                   <span>Archived ({length(@archived_users)})</span>
-                </summary>
-                <div class="mt-3 space-y-2">
+                </button>
+                <div :if={@show_archived} class="mt-3 space-y-2">
                   <div
                     :for={user <- @archived_users}
                     class="flex items-center justify-between p-3 rounded-xl bg-base-200/30 border border-base-300/30"
@@ -691,24 +775,46 @@ defmodule PolyxWeb.HomeLive do
                         </span>
                       </div>
                       <div>
-                        <p class="font-medium text-sm text-base-content/60">{user.label}</p>
+                        <a
+                          href={"https://polymarket.com/profile/#{user.address}"}
+                          target="_blank"
+                          class="font-medium text-sm text-base-content/60 hover:text-primary transition-colors"
+                        >
+                          {user.label}
+                          <.icon
+                            name="hero-arrow-top-right-on-square"
+                            class="size-3 inline ml-0.5 opacity-50"
+                          />
+                        </a>
                         <p class="text-xs text-base-content/30 font-mono">
                           {String.slice(user.address, 0, 10)}...{String.slice(user.address, -6, 6)}
                         </p>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      phx-click="restore_user"
-                      phx-value-address={user.address}
-                      title="Restore user"
-                      class="px-3 py-1.5 rounded-lg text-xs font-medium bg-primary/10 text-primary hover:bg-primary hover:text-primary-content transition-colors"
-                    >
-                      Restore
-                    </button>
+                    <div class="flex items-center gap-2">
+                      <button
+                        type="button"
+                        phx-click="restore_user"
+                        phx-value-address={user.address}
+                        title="Restore user"
+                        class="px-3 py-1.5 rounded-lg text-xs font-medium bg-primary/10 text-primary hover:bg-primary hover:text-primary-content transition-colors"
+                      >
+                        Restore
+                      </button>
+                      <button
+                        type="button"
+                        phx-click="delete_user"
+                        phx-value-address={user.address}
+                        data-confirm="Are you sure you want to permanently delete this wallet? This cannot be undone."
+                        title="Delete permanently"
+                        class="p-1.5 rounded-lg text-error/60 hover:text-error hover:bg-error/10 transition-colors"
+                      >
+                        <.icon name="hero-trash" class="size-4" />
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </details>
+              </div>
 
               <%!-- Live Feed from Tracked Wallets --%>
               <div class="rounded-2xl bg-base-200/50 border border-base-300 overflow-hidden">
@@ -804,6 +910,15 @@ defmodule PolyxWeb.HomeLive do
                       </div>
                       <%!-- Trade details --%>
                       <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-xs">
+                        <span class={[
+                          "px-1.5 py-0.5 rounded font-semibold",
+                          item.side in ["BUY", "YES"] && "bg-success/10 text-success",
+                          item.side in ["SELL", "NO"] && "bg-error/10 text-error",
+                          item.side not in ["BUY", "YES", "SELL", "NO"] &&
+                            "bg-base-300 text-base-content/60"
+                        ]}>
+                          {item.side}
+                        </span>
                         <span class="font-mono text-base-content/70">
                           {format_shares(item.size)} shares @ {format_price(item.avg_price)}
                         </span>
@@ -853,7 +968,14 @@ defmodule PolyxWeb.HomeLive do
                     <.icon name="hero-bolt" class="size-5 text-secondary" />
                     <h2 class="font-semibold">Copy Activity</h2>
                   </div>
-                  <span class="text-xs text-base-content/40">Your executed copies</span>
+                  <button
+                    type="button"
+                    phx-click="delete_all_failed"
+                    data-confirm="Delete all failed trades? This cannot be undone."
+                    class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-error/10 text-error text-xs font-medium hover:bg-error hover:text-error-content transition-colors"
+                  >
+                    <.icon name="hero-trash" class="size-3.5" /> Delete All Failed
+                  </button>
                 </div>
 
                 <div
@@ -926,6 +1048,15 @@ defmodule PolyxWeb.HomeLive do
                       </div>
                       <%!-- Position details --%>
                       <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-xs">
+                        <span class={[
+                          "px-1.5 py-0.5 rounded font-semibold",
+                          trade.side in ["BUY", "YES"] && "bg-success/10 text-success",
+                          trade.side in ["SELL", "NO"] && "bg-error/10 text-error",
+                          trade.side not in ["BUY", "YES", "SELL", "NO"] &&
+                            "bg-base-300 text-base-content/60"
+                        ]}>
+                          {trade.side}
+                        </span>
                         <span class="font-mono text-base-content/70">
                           ${format_size(trade.copy_size)} ({format_shares_from_trade(trade)} shares) @ {format_price(
                             trade.original_price

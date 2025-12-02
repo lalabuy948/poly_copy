@@ -15,7 +15,11 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   import Ecto.Query
 
-  @poll_interval :timer.seconds(10)
+  # Polymarket Data API rate limit: 200 requests / 10 seconds
+  # We use 50% of capacity to leave headroom for other operations
+  # With 100 req/10s budget and 3s interval, we can track up to 33 users comfortably
+  @base_poll_interval :timer.seconds(3)
+  @max_requests_per_10s 100
 
   defstruct tracked_users: %{},
             last_trade_ids: %{},
@@ -58,6 +62,10 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   def update_user_label(address, label) do
     GenServer.call(__MODULE__, {:update_user_label, address, label})
+  end
+
+  def delete_user(address) do
+    GenServer.call(__MODULE__, {:delete_user, address})
   end
 
   def get_user_trades(address) do
@@ -211,7 +219,11 @@ defmodule Polyx.CopyTrading.TradeWatcher do
               {:ok, _updated} ->
                 # Update in-memory state
                 updated_user = %{user_info | label: label}
-                new_state = %{state | tracked_users: Map.put(state.tracked_users, address, updated_user)}
+
+                new_state = %{
+                  state
+                  | tracked_users: Map.put(state.tracked_users, address, updated_user)
+                }
 
                 Logger.info("Updated label for #{address} to: #{label}")
                 CopyTrading.broadcast(:user_label_updated, updated_user)
@@ -221,6 +233,35 @@ defmodule Polyx.CopyTrading.TradeWatcher do
               {:error, changeset} ->
                 {:reply, {:error, changeset.errors}, state}
             end
+        end
+    end
+  end
+
+  @impl true
+  def handle_call({:delete_user, address}, _from, state) do
+    address = normalize_address(address)
+
+    # Only allow deleting archived (inactive) users
+    case Repo.get_by(TrackedUser, address: address, active: false) do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      db_user ->
+        case Repo.delete(db_user) do
+          {:ok, deleted_user} ->
+            user_info = %{
+              id: deleted_user.id,
+              address: deleted_user.address,
+              label: deleted_user.label
+            }
+
+            Logger.info("Permanently deleted user: #{deleted_user.label} (#{address})")
+            CopyTrading.broadcast(:user_deleted, user_info)
+
+            {:reply, {:ok, user_info}, state}
+
+          {:error, changeset} ->
+            {:reply, {:error, changeset.errors}, state}
         end
     end
   end
@@ -313,8 +354,26 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   defp schedule_poll(state) do
     if state.poll_ref, do: Process.cancel_timer(state.poll_ref)
-    ref = Process.send_after(self(), :poll, @poll_interval)
+    interval = calculate_poll_interval(state)
+    ref = Process.send_after(self(), :poll, interval)
     %{state | poll_ref: ref}
+  end
+
+  # Calculate poll interval dynamically based on number of tracked users
+  # Goal: stay under 100 requests per 10 seconds (50% of API limit)
+  defp calculate_poll_interval(state) do
+    user_count = map_size(state.tracked_users)
+
+    if user_count == 0 do
+      @base_poll_interval
+    else
+      # Requests per poll = user_count
+      # Max polls per 10s = @max_requests_per_10s / user_count
+      # Min interval = 10_000ms / max_polls
+      min_interval_ms = div(10_000 * user_count, @max_requests_per_10s)
+      # Use whichever is larger: base interval or calculated minimum
+      max(@base_poll_interval, min_interval_ms)
+    end
   end
 
   defp fetch_user_trades(address) do

@@ -56,6 +56,10 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     GenServer.call(__MODULE__, {:delete_copy_trade, trade_id})
   end
 
+  def delete_all_failed_copy_trades do
+    GenServer.call(__MODULE__, :delete_all_failed_copy_trades)
+  end
+
   # Server callbacks
 
   @impl true
@@ -162,6 +166,34 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
       %CopyTrade{} ->
         {:reply, {:error, :not_failed}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:delete_all_failed_copy_trades, _from, state) do
+    import Ecto.Query
+
+    failed_trades =
+      CopyTrade
+      |> where([t], t.status == "failed")
+      |> Repo.all()
+
+    if failed_trades == [] do
+      {:reply, {:ok, 0}, state}
+    else
+      # Delete all failed trades and broadcast deletions
+      Enum.each(failed_trades, fn db_trade ->
+        case Repo.delete(db_trade) do
+          {:ok, deleted_trade} ->
+            stream_trade = CopyTrade.to_stream_format(deleted_trade)
+            CopyTrading.broadcast(:copy_trade_deleted, stream_trade)
+
+          {:error, _reason} ->
+            :ok
+        end
+      end)
+
+      {:reply, {:ok, length(failed_trades)}, state}
     end
   end
 

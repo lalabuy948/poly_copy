@@ -42,6 +42,14 @@ defmodule Polyx.CopyTrading do
   end
 
   @doc """
+  Permanently delete an archived user from the database.
+  Only works for archived (inactive) users.
+  """
+  def delete_user(address) do
+    TradeWatcher.delete_user(address)
+  end
+
+  @doc """
   Update the label for a tracked user.
   """
   def update_user_label(address, label) do
@@ -102,6 +110,14 @@ defmodule Polyx.CopyTrading do
   """
   def delete_copy_trade(trade_id) do
     TradeExecutor.delete_copy_trade(trade_id)
+  end
+
+  @doc """
+  Delete all failed copy trades.
+  Returns {:ok, count} where count is the number of deleted trades.
+  """
+  def delete_all_failed_copy_trades do
+    TradeExecutor.delete_all_failed_copy_trades()
   end
 
   @doc """

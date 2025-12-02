@@ -10,8 +10,7 @@ defmodule Polyx.Application do
     children = [
       PolyxWeb.Telemetry,
       Polyx.Repo,
-      {Ecto.Migrator,
-       repos: Application.fetch_env!(:polyx, :ecto_repos), skip: skip_migrations?()},
+      {Ecto.Migrator, repos: Application.fetch_env!(:polyx, :ecto_repos), skip: false},
       {DNSCluster, query: Application.get_env(:polyx, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Polyx.PubSub},
       # Copy trading GenServers
