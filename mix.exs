@@ -11,7 +11,8 @@ defmodule Polyx.MixProject do
       aliases: aliases(),
       deps: deps(),
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
-      listeners: [Phoenix.CodeReloader]
+      listeners: [Phoenix.CodeReloader],
+      releases: releases()
     ]
   end
 
@@ -28,6 +29,22 @@ defmodule Polyx.MixProject do
   def cli do
     [
       preferred_envs: [precommit: :test]
+    ]
+  end
+
+  def releases do
+    [
+      poly_copy: [
+        steps: [:assemble, &Burrito.wrap/1],
+        burrito: [
+          targets: [
+            macos: [os: :darwin, cpu: :x86_64],
+            macos_silicon: [os: :darwin, cpu: :aarch64],
+            linux: [os: :linux, cpu: :x86_64],
+            windows: [os: :windows, cpu: :x86_64]
+          ]
+        ]
+      ]
     ]
   end
 
@@ -69,7 +86,8 @@ defmodule Polyx.MixProject do
       {:tidewave, "~> 0.5", only: :dev},
       # Crypto libs for EIP-712 signing
       {:ex_keccak, "~> 0.7"},
-      {:ex_secp256k1, "~> 0.7"}
+      {:ex_secp256k1, "~> 0.7"},
+      {:burrito, "~> 1.1"}
     ]
   end
 

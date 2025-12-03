@@ -10,7 +10,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   alias Polyx.Polymarket.Client
   alias Polyx.CopyTrading
-  alias Polyx.CopyTrading.CopyTrade
+  alias Polyx.CopyTrading.{CopyTrade, Settings}
   alias Polyx.Repo
 
   defstruct settings: %{
@@ -66,7 +66,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
   def init(_opts) do
     # Subscribe to trade events
     CopyTrading.subscribe()
-    {:ok, %__MODULE__{}}
+
+    # Load settings from database
+    settings = Settings.get_or_create() |> Settings.to_map()
+
+    {:ok, %__MODULE__{settings: settings}}
   end
 
   @impl true
@@ -76,31 +80,15 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   @impl true
   def handle_call({:update_settings, opts}, _from, state) do
-    new_settings =
-      Enum.reduce(opts, state.settings, fn
-        {:sizing_mode, mode}, settings when mode in [:fixed, :proportional, :percentage] ->
-          Map.put(settings, :sizing_mode, mode)
+    case Settings.update(opts) do
+      {:ok, new_settings} ->
+        Logger.info("Updated copy trading settings: #{inspect(new_settings)}")
+        CopyTrading.broadcast(:settings_updated, new_settings)
+        {:reply, {:ok, new_settings}, %{state | settings: new_settings}}
 
-        {:fixed_amount, amount}, settings when is_number(amount) and amount > 0 ->
-          Map.put(settings, :fixed_amount, amount)
-
-        {:proportional_factor, factor}, settings when is_number(factor) and factor > 0 ->
-          Map.put(settings, :proportional_factor, factor)
-
-        {:percentage, pct}, settings when is_number(pct) and pct > 0 and pct <= 100 ->
-          Map.put(settings, :percentage, pct)
-
-        {:enabled, enabled}, settings when is_boolean(enabled) ->
-          Map.put(settings, :enabled, enabled)
-
-        _, settings ->
-          settings
-      end)
-
-    Logger.info("Updated copy trading settings: #{inspect(new_settings)}")
-    CopyTrading.broadcast(:settings_updated, new_settings)
-
-    {:reply, {:ok, new_settings}, %{state | settings: new_settings}}
+      {:error, _changeset} = error ->
+        {:reply, error, state}
+    end
   end
 
   @impl true
@@ -223,6 +211,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   @impl true
   def handle_info({:user_untracked, _user_info}, state) do
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:user_deleted, _user_info}, state) do
     {:noreply, state}
   end
 

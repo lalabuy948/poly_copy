@@ -1,18 +1,39 @@
-# Polyx
+# == Poly Copy ==
 
-To start your Phoenix server:
+![](github/poly_copy_screenshot.png)
 
-* Run `mix setup` to install and setup dependencies
-* Start Phoenix endpoint with `mix phx.server` or inside IEx with `iex -S mix phx.server`
+## Demo
 
-Now you can visit [`localhost:4000`](http://localhost:4000) from your browser.
+## FAQ 
 
-Ready to run in production? Please [check our deployment guides](https://hexdocs.pm/phoenix/deployment.html).
+<details>
+  <summary>1. Where data is being stored? </summary>
+  
+  Everything runs and stays on your machine, `.db` file holds your credentials and keys next to the binary.
+</details>
 
-## Learn more
+<details>
+  <summary>2. How to start? </summary>
+  
+  Get binary from releases for your OS or run in dev mode via elixir. 
+</details>
 
-* Official website: https://www.phoenixframework.org/
-* Guides: https://hexdocs.pm/phoenix/overview.html
-* Docs: https://hexdocs.pm/phoenix
-* Forum: https://elixirforum.com/c/phoenix-forum
-* Source: https://github.com/phoenixframework/phoenix
+<details>
+  <summary>3. Is it safe? </summary>
+  
+  It's open source, your own risk. But yes, runs ok, no issues while I was running it.
+</details>
+
+<details>
+  <summary>4. Is it free? </summary>
+  
+  It's open source, yes. But donations are welcome. 
+</details>
+
+## Development
+
+```zsh
+mix setup
+
+mix phx.server
+```

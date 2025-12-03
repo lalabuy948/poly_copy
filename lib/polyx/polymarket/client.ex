@@ -257,12 +257,7 @@ defmodule Polyx.Polymarket.Client do
   Check if credentials are configured.
   """
   def credentials_configured? do
-    api_key = config()[:api_key]
-    api_secret = config()[:api_secret]
-    passphrase = config()[:api_passphrase]
-    wallet_address = config()[:wallet_address]
-
-    !!(api_key && api_secret && passphrase && wallet_address)
+    Polyx.Credentials.configured?()
   end
 
   @doc """
@@ -285,6 +280,13 @@ defmodule Polyx.Polymarket.Client do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Get full balance and allowance info for debugging.
+  """
+  def get_balance_allowance_raw do
+    authenticated_get("/balance-allowance", %{asset_type: "COLLATERAL", signature_type: "2"})
   end
 
   @doc """
@@ -496,6 +498,7 @@ defmodule Polyx.Polymarket.Client do
   end
 
   defp config do
-    Application.get_env(:polyx, :polymarket, [])
+    # Read from database credentials instead of Application config
+    Polyx.Credentials.to_config()
   end
 end

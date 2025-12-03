@@ -11,7 +11,6 @@ defmodule Polyx.Application do
       PolyxWeb.Telemetry,
       Polyx.Repo,
       {Ecto.Migrator, repos: Application.fetch_env!(:polyx, :ecto_repos), skip: false},
-      {DNSCluster, query: Application.get_env(:polyx, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Polyx.PubSub},
       # Copy trading GenServers
       Polyx.CopyTrading.TradeWatcher,
@@ -34,8 +33,8 @@ defmodule Polyx.Application do
     :ok
   end
 
-  defp skip_migrations?() do
-    # By default, sqlite migrations are run when using a release
-    System.get_env("RELEASE_NAME") == nil
-  end
+  # defp skip_migrations?() do
+  #   # By default, sqlite migrations are run when using a release
+  #   System.get_env("RELEASE_NAME") == nil
+  # end
 end

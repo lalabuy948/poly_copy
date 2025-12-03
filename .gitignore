@@ -41,7 +41,12 @@ npm-debug.log
 
 .env
 .env.metamask
+.env.example
 
 .venv
 .elixir_ls
 .cursor
+
+polyx_server/
+burrito_out/
+PLAN.md

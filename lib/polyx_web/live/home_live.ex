@@ -33,6 +33,9 @@ defmodule PolyxWeb.HomeLive do
      |> assign(:settings, settings)
      |> assign(:add_user_form, to_form(%{"address" => "", "label" => ""}))
      |> assign(:api_configured, Polyx.Polymarket.Client.credentials_configured?())
+     |> assign(:credentials, Polyx.Credentials.to_masked_map())
+     |> assign(:credentials_form, Polyx.Credentials.to_raw_map())
+     |> assign(:show_credentials, false)
      |> assign(:copied_trade_ids, copied_trade_ids)
      |> assign(:account_summary, account_summary)
      |> assign(:feed_filter, nil)
@@ -220,6 +223,50 @@ defmodule PolyxWeb.HomeLive do
 
       {:error, _reason} ->
         {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def handle_event("toggle_credentials", _params, socket) do
+    # Reload form data when opening the form
+    socket =
+      if !socket.assigns.show_credentials do
+        assign(socket, :credentials_form, Polyx.Credentials.to_raw_map())
+      else
+        socket
+      end
+
+    {:noreply, assign(socket, :show_credentials, !socket.assigns.show_credentials)}
+  end
+
+  @impl true
+  def handle_event("save_credentials", params, socket) do
+    attrs = %{
+      api_key: params["api_key"],
+      api_secret: params["api_secret"],
+      api_passphrase: params["api_passphrase"],
+      wallet_address: params["wallet_address"],
+      signer_address: params["signer_address"],
+      private_key: params["private_key"]
+    }
+
+    case Polyx.Credentials.update(attrs) do
+      {:ok, _creds} ->
+        {:noreply,
+         socket
+         |> assign(:credentials, Polyx.Credentials.to_masked_map())
+         |> assign(:api_configured, Polyx.Credentials.configured?())
+         |> assign(:show_credentials, false)
+         |> assign(:account_summary, fetch_account_summary())
+         |> put_flash(:info, "Credentials saved successfully")}
+
+      {:error, changeset} ->
+        errors =
+          Ecto.Changeset.traverse_errors(changeset, fn {msg, _opts} -> msg end)
+          |> Enum.map(fn {field, msgs} -> "#{field}: #{Enum.join(msgs, ", ")}" end)
+          |> Enum.join("; ")
+
+        {:noreply, put_flash(socket, :error, "Failed to save: #{errors}")}
     end
   end
 
@@ -477,8 +524,8 @@ defmodule PolyxWeb.HomeLive do
                     <.icon name="hero-arrow-path" class="size-5 text-white" />
                   </div>
                   <div>
-                    <h1 class="text-xl font-bold tracking-tight">Copy Trading</h1>
-                    <p class="text-xs text-base-content/50">Polymarket</p>
+                    <h1 class="text-xl font-bold tracking-tight">Poly Copy</h1>
+                    <p class="text-xs text-base-content/50">Polymarket copy trading</p>
                   </div>
                 </div>
               </div>
@@ -537,15 +584,24 @@ defmodule PolyxWeb.HomeLive do
           <%!-- Alert for unconfigured API --%>
           <div
             :if={!@api_configured}
-            class="mb-6 p-4 rounded-xl bg-error/5 border border-error/20 flex items-start gap-3"
+            class="mb-6 p-4 rounded-xl bg-error/5 border border-error/20 flex items-start justify-between gap-3"
           >
-            <.icon name="hero-exclamation-triangle" class="size-5 text-error shrink-0 mt-0.5" />
-            <div class="text-sm">
-              <p class="font-medium text-error">API credentials not configured</p>
-              <p class="text-base-content/60 mt-1">
-                Add your Polymarket credentials to .env file to enable trade tracking.
-              </p>
+            <div class="flex items-start gap-3">
+              <.icon name="hero-exclamation-triangle" class="size-5 text-error shrink-0 mt-0.5" />
+              <div class="text-sm">
+                <p class="font-medium text-error">API credentials not configured</p>
+                <p class="text-base-content/60 mt-1">
+                  Add your Polymarket API credentials to enable trade tracking.
+                </p>
+              </div>
             </div>
+            <button
+              type="button"
+              phx-click="toggle_credentials"
+              class="px-3 py-1.5 rounded-lg bg-error/10 text-error text-sm font-medium hover:bg-error/20 transition-colors shrink-0"
+            >
+              Configure
+            </button>
           </div>
 
           <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
@@ -1152,6 +1208,158 @@ defmodule PolyxWeb.HomeLive do
                       )}
                     </span>
                   </div>
+                </div>
+              </div>
+
+              <%!-- API Credentials Card --%>
+              <div class="rounded-2xl bg-base-200/50 border border-base-300 overflow-hidden">
+                <div class="px-5 py-4 border-b border-base-300">
+                  <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                      <.icon name="hero-key" class="size-5 text-warning" />
+                      <h2 class="font-semibold">API Credentials</h2>
+                    </div>
+                    <button
+                      type="button"
+                      phx-click="toggle_credentials"
+                      class="text-xs text-base-content/60 hover:text-base-content flex items-center gap-1"
+                    >
+                      <%= if @show_credentials do %>
+                        <.icon name="hero-chevron-up" class="size-4" /> Hide
+                      <% else %>
+                        <.icon name="hero-chevron-down" class="size-4" />
+                        {if @api_configured, do: "Edit", else: "Setup"}
+                      <% end %>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="p-5">
+                  <%= if @show_credentials do %>
+                    <form
+                      phx-submit="save_credentials"
+                      id="credentials-form"
+                      phx-update="ignore"
+                      class="space-y-4"
+                    >
+                      <div class="space-y-3">
+                        <div>
+                          <label class="block text-xs font-medium text-base-content/60 mb-1">
+                            API Key
+                          </label>
+                          <input
+                            type="text"
+                            name="api_key"
+                            value={@credentials_form.api_key}
+                            placeholder="Enter API key"
+                            class="w-full px-3 py-2 rounded-lg bg-base-100 border border-base-300 text-sm placeholder:text-base-content/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                          />
+                        </div>
+                        <div>
+                          <label class="block text-xs font-medium text-base-content/60 mb-1">
+                            API Secret
+                          </label>
+                          <input
+                            type="text"
+                            name="api_secret"
+                            value={@credentials_form.api_secret}
+                            placeholder="Enter API secret"
+                            class="w-full px-3 py-2 rounded-lg bg-base-100 border border-base-300 text-sm placeholder:text-base-content/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                          />
+                        </div>
+                        <div>
+                          <label class="block text-xs font-medium text-base-content/60 mb-1">
+                            API Passphrase
+                          </label>
+                          <input
+                            type="text"
+                            name="api_passphrase"
+                            value={@credentials_form.api_passphrase}
+                            placeholder="Enter API passphrase"
+                            class="w-full px-3 py-2 rounded-lg bg-base-100 border border-base-300 text-sm placeholder:text-base-content/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                          />
+                        </div>
+                        <div>
+                          <label class="block text-xs font-medium text-base-content/60 mb-1">
+                            Wallet Address (Proxy)
+                          </label>
+                          <input
+                            type="text"
+                            name="wallet_address"
+                            value={@credentials_form.wallet_address}
+                            placeholder="0x..."
+                            class="w-full px-3 py-2 rounded-lg bg-base-100 border border-base-300 text-sm font-mono placeholder:text-base-content/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                          />
+                        </div>
+                        <div>
+                          <label class="block text-xs font-medium text-base-content/60 mb-1">
+                            Signer Address (Optional)
+                          </label>
+                          <input
+                            type="text"
+                            name="signer_address"
+                            value={@credentials_form.signer_address}
+                            placeholder="0x... (leave empty if same as wallet)"
+                            class="w-full px-3 py-2 rounded-lg bg-base-100 border border-base-300 text-sm font-mono placeholder:text-base-content/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                          />
+                        </div>
+                        <div>
+                          <label class="block text-xs font-medium text-base-content/60 mb-1">
+                            Private Key
+                          </label>
+                          <input
+                            type="text"
+                            name="private_key"
+                            value={@credentials_form.private_key}
+                            placeholder="Enter private key (without 0x prefix)"
+                            class="w-full px-3 py-2 rounded-lg bg-base-100 border border-base-300 text-sm font-mono placeholder:text-base-content/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                          />
+                        </div>
+                      </div>
+                      <div class="flex gap-2">
+                        <button
+                          type="submit"
+                          class="flex-1 px-4 py-2 rounded-lg bg-primary text-primary-content font-medium text-sm hover:bg-primary/90 transition-colors"
+                        >
+                          Save Credentials
+                        </button>
+                        <button
+                          type="button"
+                          phx-click="toggle_credentials"
+                          class="px-4 py-2 rounded-lg bg-base-300 text-base-content font-medium text-sm hover:bg-base-300/80 transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  <% else %>
+                    <div class="space-y-2 text-sm">
+                      <div class="flex items-center justify-between">
+                        <span class="text-base-content/60">Status</span>
+                        <%= if @api_configured do %>
+                          <span class="px-2 py-0.5 rounded-full bg-success/10 text-success text-xs font-medium">
+                            Configured
+                          </span>
+                        <% else %>
+                          <span class="px-2 py-0.5 rounded-full bg-error/10 text-error text-xs font-medium">
+                            Not configured
+                          </span>
+                        <% end %>
+                      </div>
+                      <%= if @credentials.wallet_address do %>
+                        <div class="flex items-center justify-between">
+                          <span class="text-base-content/60">Wallet</span>
+                          <span class="font-mono text-xs">
+                            {String.slice(@credentials.wallet_address || "", 0, 6)}...{String.slice(
+                              @credentials.wallet_address || "",
+                              -4,
+                              4
+                            )}
+                          </span>
+                        </div>
+                      <% end %>
+                    </div>
+                  <% end %>
                 </div>
               </div>
 
