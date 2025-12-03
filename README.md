@@ -30,6 +30,12 @@
   It's open source, yes. But donations are welcome. 
 </details>
 
+Donations are welcome:
+
+- eth `0x608a6868600a1852e301e6970f49e20f7b03e0b3`
+- sol `Cbq21vU7jSZrXfNC9rYofLPxDh4GMB22PaNAZzpfdVf4`
+- btc `bc1qq65lvhjym4t836c7uvqgahcdmjqys3x9u6dxr6`
+
 ## Development
 
 ```zsh
