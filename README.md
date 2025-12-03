@@ -15,7 +15,7 @@
 <details>
   <summary>2. How to start? </summary>
   
-  Get binary from releases for your OS or run in dev mode via elixir. 
+  Get binary from [releases](https://github.com/lalabuy948/poly_copy/releases) for your OS or run in dev mode via elixir. 
 </details>
 
 <details>
