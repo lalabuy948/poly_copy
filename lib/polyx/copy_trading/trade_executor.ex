@@ -112,7 +112,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
               {"executed", DateTime.utc_now(), nil}
 
             {:error, reason} ->
-              {"failed", DateTime.utc_now(), inspect(reason)}
+              {"failed", DateTime.utc_now(), format_error(reason)}
           end
 
         # Update the database record
@@ -275,7 +275,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
           {:error, reason} ->
             Logger.error("Failed to execute copy trade: #{inspect(reason)}")
-            {"failed", DateTime.utc_now(), inspect(reason)}
+            {"failed", DateTime.utc_now(), format_error(reason)}
         end
 
       # Save to database
@@ -309,9 +309,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     end
   end
 
-  # Polymarket minimum order size is 5 SHARES (not dollars)
-  # At typical prices, this is roughly $0.50 to $5 depending on price
+  # Polymarket has TWO minimum requirements:
+  # 1. Minimum 5 shares per order
+  # 2. Minimum $1 dollar value for marketable orders
   @min_order_shares 5.0
+  @min_order_dollars 1.0
 
   defp calculate_size(settings, original_trade, price) do
     original_size = parse_size(original_trade["size"])
@@ -338,7 +340,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     shares = if price > 0, do: dollar_amount / price, else: dollar_amount
 
     # Enforce minimum of 5 shares (Polymarket API requirement)
-    max(shares, @min_order_shares)
+    shares = max(shares, @min_order_shares)
+
+    # Also enforce minimum $1 dollar value for marketable orders
+    min_shares_for_dollar = if price > 0, do: @min_order_dollars / price, else: @min_order_shares
+    max(shares, min_shares_for_dollar)
   end
 
   defp parse_size(size) when is_binary(size), do: String.to_float(size)
@@ -367,4 +373,9 @@ defmodule Polyx.CopyTrading.TradeExecutor do
   defp decimal_to_float(nil), do: nil
   defp decimal_to_float(%Decimal{} = d), do: Decimal.to_float(d)
   defp decimal_to_float(n) when is_number(n), do: n
+
+  # Format API errors to extract human-readable message
+  defp format_error({_status, %{"error" => message}}) when is_binary(message), do: message
+  defp format_error({_status, %{error: message}}) when is_binary(message), do: message
+  defp format_error(reason), do: inspect(reason)
 end

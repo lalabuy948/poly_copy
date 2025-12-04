@@ -208,11 +208,11 @@ defmodule Polyx.Polymarket.OrderBuilder do
     # - makerAmount (USDC): max 4 decimals
     # - takerAmount (tokens): max 2 decimals
     #
-    # IMPORTANT: Round size first, then calculate USDC based on rounded size
-    # to ensure maker_amount / taker_amount = price (API validation requirement)
-    rounded_size = round_down_decimals(size, 2)
-    token_amount = (rounded_size * 1_000_000) |> trunc()
-    usdc_amount = (round_down_decimals(rounded_size * price, 4) * 1_000_000) |> trunc()
+    # Round size to 2 decimals, then calculate USDC = size * price rounded to 4 decimals
+    # The API validates that makerAmount / takerAmount matches the price
+    rounded_size = Float.round(size * 1.0, 2)
+    token_amount = round(rounded_size * 1_000_000)
+    usdc_amount = round(Float.round(rounded_size * price, 4) * 1_000_000)
 
     {usdc_amount, token_amount}
   end
@@ -227,19 +227,12 @@ defmodule Polyx.Polymarket.OrderBuilder do
     # - makerAmount (tokens): max 2 decimals
     # - takerAmount (USDC): max 4 decimals
     #
-    # IMPORTANT: Round size first, then calculate USDC based on rounded size
-    rounded_size = round_down_decimals(size, 2)
-    token_amount = (rounded_size * 1_000_000) |> trunc()
-    usdc_amount = (round_down_decimals(rounded_size * price, 4) * 1_000_000) |> trunc()
+    # Round size to 2 decimals, then calculate USDC = size * price rounded to 4 decimals
+    rounded_size = Float.round(size * 1.0, 2)
+    token_amount = round(rounded_size * 1_000_000)
+    usdc_amount = round(Float.round(rounded_size * price, 4) * 1_000_000)
 
     {token_amount, usdc_amount}
-  end
-
-  # Round down to specified decimal places (for human-readable amounts)
-  # e.g., round_down_decimals(5.019, 2) = 5.01
-  defp round_down_decimals(amount, decimals) do
-    multiplier = :math.pow(10, decimals)
-    Float.floor(amount * multiplier) / multiplier
   end
 
   defp side_to_int(:buy), do: @side_buy
