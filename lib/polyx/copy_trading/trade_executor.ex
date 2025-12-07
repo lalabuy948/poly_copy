@@ -203,7 +203,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     if state.settings.enabled do
       {:noreply, do_execute_copy_trade(state, source_address, trade)}
     else
-      Logger.debug("Copy trading disabled, ignoring trade from #{source_address}")
+      # Logger.debug("Copy trading disabled, ignoring trade from #{source_address}")
       {:noreply, state}
     end
   end
@@ -381,7 +381,6 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   # Format API errors to extract human-readable message
   defp format_error(%Polyx.Polymarket.Client.APIError{message: message}), do: message
-  defp format_error(reason) when is_binary(reason), do: reason
   defp format_error(reason) when is_atom(reason), do: humanize_atom(reason)
 
   defp format_error({_status, %{"error" => message}}) when is_binary(message), do: message

@@ -330,6 +330,12 @@ defmodule Polyx.CopyTrading.TradeWatcher do
   end
 
   @impl true
+  def handle_info({:trades_fetched, _address, {:error, :rate_limited}}, state) do
+    # Rate limited - silently skip, will retry on next poll
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info({:trades_fetched, address, {:error, reason}}, state) do
     Logger.warning("Failed to fetch trades for #{address}: #{inspect(reason)}")
     {:noreply, state}

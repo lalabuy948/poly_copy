@@ -398,10 +398,8 @@ defmodule Polyx.Polymarket.Client do
   # Fetch activities using concurrent requests for speed
   # Uses a smart probe to avoid unnecessary concurrent requests for small profiles
   defp fetch_activities_concurrent(address, max_activities, on_progress) do
-    # For small limits, just fetch exactly what we need (non-blocking for background polling)
+    # For small limits, use non-blocking to avoid blocking background polling
     if max_activities <= 500 do
-      Logger.debug("[Client] Small activity fetch, limit=#{max_activities}")
-
       case data_api_get_nowait("/activity", %{user: address, limit: max_activities, offset: 0}) do
         {:ok, activities} when is_list(activities) ->
           if on_progress do
@@ -411,9 +409,8 @@ defmodule Polyx.Polymarket.Client do
           {:ok, activities}
 
         {:error, :rate_limited} ->
-          # Rate limited - this is expected for background polling, will retry on next poll
-          Logger.debug("[Client] Small activity fetch rate limited, will retry on next poll")
-          {:ok, []}
+          # Return error so caller knows to retry later
+          {:error, :rate_limited}
 
         {:error, reason} ->
           {:error, reason}
@@ -804,7 +801,7 @@ defmodule Polyx.Polymarket.Client do
   end
 
   # Data API request without waiting for rate limiter (for background polling)
-  # Uses try_acquire - if rate limited, fails immediately instead of blocking
+  # Returns {:error, :rate_limited} immediately if rate limited
   defp data_api_get_nowait(path, params) do
     case RateLimiter.try_acquire(:data) do
       :ok ->

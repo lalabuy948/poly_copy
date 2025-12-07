@@ -350,63 +350,27 @@ defmodule PolyxWeb.HomeLive do
   end
 
   @impl true
-  def handle_info({:new_trade, %{address: address, trade: trade}}, socket) do
-    # Find the user label for this address
-    user = Enum.find(socket.assigns.tracked_users, fn u -> u.address == address end)
-    label = if user, do: user.label, else: short_address(address)
-
-    # Create feed item for the live feed stream
-    feed_item = %{
-      id: trade["id"] || System.unique_integer([:positive]),
-      trade_id: trade["id"],
-      address: address,
-      label: label,
-      side: trade["side"] || "UNKNOWN",
-      size: parse_trade_value(trade["size"]),
-      price: parse_trade_value(trade["price"]),
-      avg_price: parse_trade_value(trade["avgPrice"]),
-      outcome: trade["outcome"],
-      title: trade["title"],
-      market_slug: trade["market_slug"],
-      event_slug: trade["event_slug"],
-      asset_id: trade["asset_id"],
-      pnl: parse_trade_value(trade["pnl"]),
-      percent_pnl: parse_trade_value(trade["percentPnl"]),
-      current_value: parse_trade_value(trade["currentValue"]),
-      end_date: trade["endDate"],
-      icon: trade["icon"],
-      redeemable: trade["redeemable"],
-      timestamp: parse_timestamp(trade["timestamp"]),
-      usdc_size: parse_trade_value(trade["usdcSize"])
-    }
-
-    # Update tracked users with new trades
-    updated_users =
-      Enum.map(socket.assigns.tracked_users, fn user ->
-        if user.address == address do
-          case CopyTrading.get_user_trades(address) do
-            {:ok, trades} -> %{user | trades: trades}
-            _ -> user
-          end
-        else
-          user
-        end
-      end)
-
-    {:noreply,
-     socket
-     |> assign(:tracked_users, updated_users)
-     |> stream_insert(:live_feed, feed_item, at: 0)}
+  def handle_info({:new_trade, %{address: _address, trade: _trade}}, socket) do
+    # Don't insert here - let :trades_updated handle the feed with proper sorting
+    # This event is still useful for copy trading execution
+    {:noreply, socket}
   end
 
   @impl true
   def handle_info({:copy_trade_executed, trade}, socket) do
     copied_ids = MapSet.put(socket.assigns.copied_trade_ids, trade.original_trade_id)
 
+    # Rebuild live feed to show "Copied" label on the trade
+    live_feed =
+      socket.assigns.tracked_users
+      |> collect_live_feed()
+      |> filter_feed(socket.assigns.feed_filter)
+
     socket =
       socket
       |> assign(:copied_trade_ids, copied_ids)
       |> stream_insert(:copy_trades, trade, at: 0)
+      |> stream(:live_feed, live_feed, reset: true)
 
     # Show flash based on trade status
     socket =
@@ -477,26 +441,36 @@ defmodule PolyxWeb.HomeLive do
 
   @impl true
   def handle_info({:trades_updated, %{address: address, trades: trades}}, socket) do
-    # Update tracked user's trades
-    updated_users =
-      Enum.map(socket.assigns.tracked_users, fn user ->
-        if user.address == address do
-          %{user | trades: trades}
-        else
-          user
-        end
-      end)
+    # Check if trades actually changed for this user
+    current_user = Enum.find(socket.assigns.tracked_users, &(&1.address == address))
+    current_trade_ids = if current_user, do: Enum.map(current_user.trades, & &1["id"]), else: []
+    new_trade_ids = Enum.map(trades, & &1["id"])
 
-    # Rebuild live feed with updated trades
-    live_feed =
-      updated_users
-      |> collect_live_feed()
-      |> filter_feed(socket.assigns.feed_filter)
+    if current_trade_ids == new_trade_ids do
+      # No change in trades, skip update
+      {:noreply, socket}
+    else
+      # Update tracked user's trades
+      updated_users =
+        Enum.map(socket.assigns.tracked_users, fn user ->
+          if user.address == address do
+            %{user | trades: trades}
+          else
+            user
+          end
+        end)
 
-    {:noreply,
-     socket
-     |> assign(:tracked_users, updated_users)
-     |> stream(:live_feed, live_feed, reset: true)}
+      # Rebuild live feed with updated trades (ensures correct sort order across all users)
+      live_feed =
+        updated_users
+        |> collect_live_feed()
+        |> filter_feed(socket.assigns.feed_filter)
+
+      {:noreply,
+       socket
+       |> assign(:tracked_users, updated_users)
+       |> stream(:live_feed, live_feed, reset: true)}
+    end
   end
 
   defp parse_float(str) when is_binary(str) do

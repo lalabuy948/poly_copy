@@ -2,12 +2,16 @@ defmodule Polyx.Credentials do
   @moduledoc """
   Schema and functions for managing Polymarket API credentials.
   Credentials are stored in the database instead of .env files.
+  Uses ETS caching to avoid repeated database queries.
   """
 
   use Ecto.Schema
   import Ecto.Changeset
 
   alias Polyx.Repo
+
+  @cache_table :credentials_cache
+  @cache_key :default_credentials
 
   schema "credentials" do
     field :key, :string, default: "default"
@@ -67,8 +71,23 @@ defmodule Polyx.Credentials do
   @doc """
   Gets the credentials record, creating a default one if it doesn't exist.
   Uses a singleton pattern with key="default".
+  Results are cached in ETS to avoid repeated database queries.
   """
   def get_or_create do
+    ensure_cache_table()
+
+    case :ets.lookup(@cache_table, @cache_key) do
+      [{@cache_key, credentials}] ->
+        credentials
+
+      [] ->
+        credentials = fetch_or_create_from_db()
+        :ets.insert(@cache_table, {@cache_key, credentials})
+        credentials
+    end
+  end
+
+  defp fetch_or_create_from_db do
     case Repo.get_by(__MODULE__, key: "default") do
       nil ->
         %__MODULE__{}
@@ -80,13 +99,36 @@ defmodule Polyx.Credentials do
     end
   end
 
+  defp ensure_cache_table do
+    case :ets.whereis(@cache_table) do
+      :undefined ->
+        :ets.new(@cache_table, [:named_table, :public, :set])
+
+      _ ->
+        :ok
+    end
+  end
+
+  @doc """
+  Invalidates the credentials cache. Call after updates.
+  """
+  def invalidate_cache do
+    ensure_cache_table()
+    :ets.delete(@cache_table, @cache_key)
+  end
+
   @doc """
   Updates credentials with the given attributes.
   """
   def update(attrs) when is_map(attrs) do
-    get_or_create()
-    |> changeset(attrs)
-    |> Repo.update()
+    result =
+      fetch_or_create_from_db()
+      |> changeset(attrs)
+      |> Repo.update()
+
+    # Invalidate cache on update
+    invalidate_cache()
+    result
   end
 
   def update(opts) when is_list(opts) do
