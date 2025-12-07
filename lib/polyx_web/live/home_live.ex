@@ -531,6 +531,14 @@ defmodule PolyxWeb.HomeLive do
               </div>
 
               <div class="flex items-center gap-3">
+                <%!-- Strategies Link --%>
+                <.link
+                  navigate={~p"/strategies"}
+                  class="px-4 py-2.5 rounded-xl bg-secondary/10 hover:bg-secondary/20 transition-colors text-sm font-medium flex items-center gap-2 text-secondary"
+                >
+                  <.icon name="hero-cpu-chip" class="size-4" /> Strategies
+                </.link>
+
                 <%!-- Theme Toggle --%>
                 <button
                   type="button"
@@ -737,17 +745,27 @@ defmodule PolyxWeb.HomeLive do
                           </div>
                           <div>
                             <div class="flex items-center gap-1">
+                              <.link
+                                navigate={~p"/profile/#{user.address}"}
+                                class="font-medium text-sm hover:text-primary transition-colors"
+                              >
+                                {user.label}
+                              </.link>
+                              <.link
+                                navigate={~p"/profile/#{user.address}"}
+                                title="View trade analysis"
+                                class="p-1 rounded text-base-content/30 hover:text-info hover:bg-info/10 opacity-0 group-hover:opacity-100 transition-all"
+                              >
+                                <.icon name="hero-chart-bar" class="size-3" />
+                              </.link>
                               <a
                                 href={"https://polymarket.com/profile/#{user.address}"}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                class="font-medium text-sm hover:text-primary transition-colors"
+                                title="View on Polymarket"
+                                class="p-1 rounded text-base-content/30 hover:text-primary hover:bg-primary/10 opacity-0 group-hover:opacity-100 transition-all"
                               >
-                                {user.label}
-                                <.icon
-                                  name="hero-arrow-top-right-on-square"
-                                  class="size-3 inline ml-0.5 opacity-50"
-                                />
+                                <.icon name="hero-arrow-top-right-on-square" class="size-3" />
                               </a>
                               <button
                                 type="button"
@@ -831,17 +849,23 @@ defmodule PolyxWeb.HomeLive do
                         </span>
                       </div>
                       <div>
-                        <a
-                          href={"https://polymarket.com/profile/#{user.address}"}
-                          target="_blank"
-                          class="font-medium text-sm text-base-content/60 hover:text-primary transition-colors"
-                        >
-                          {user.label}
-                          <.icon
-                            name="hero-arrow-top-right-on-square"
-                            class="size-3 inline ml-0.5 opacity-50"
-                          />
-                        </a>
+                        <div class="flex items-center gap-1">
+                          <.link
+                            navigate={~p"/profile/#{user.address}"}
+                            class="font-medium text-sm text-base-content/60 hover:text-primary transition-colors"
+                          >
+                            {user.label}
+                          </.link>
+                          <a
+                            href={"https://polymarket.com/profile/#{user.address}"}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="View on Polymarket"
+                            class="text-base-content/30 hover:text-primary transition-colors"
+                          >
+                            <.icon name="hero-arrow-top-right-on-square" class="size-3" />
+                          </a>
+                        </div>
                         <p class="text-xs text-base-content/30 font-mono">
                           {String.slice(user.address, 0, 10)}...{String.slice(user.address, -6, 6)}
                         </p>
@@ -1349,13 +1373,25 @@ defmodule PolyxWeb.HomeLive do
                       <%= if @credentials.wallet_address do %>
                         <div class="flex items-center justify-between">
                           <span class="text-base-content/60">Wallet</span>
-                          <span class="font-mono text-xs">
-                            {String.slice(@credentials.wallet_address || "", 0, 6)}...{String.slice(
-                              @credentials.wallet_address || "",
-                              -4,
-                              4
-                            )}
-                          </span>
+                          <div class="flex items-center gap-1.5">
+                            <span class="font-mono text-xs">
+                              {String.slice(@credentials.wallet_address || "", 0, 6)}...{String.slice(
+                                @credentials.wallet_address || "",
+                                -4,
+                                4
+                              )}
+                            </span>
+                            <button
+                              type="button"
+                              phx-click={
+                                JS.dispatch("phx:copy", detail: %{text: @credentials.wallet_address})
+                              }
+                              class="p-1 rounded text-base-content/30 hover:text-primary hover:bg-primary/10 transition-all"
+                              title="Copy wallet address"
+                            >
+                              <.icon name="hero-clipboard-document" class="size-3.5" />
+                            </button>
+                          </div>
                         </div>
                       <% end %>
                     </div>
@@ -1712,11 +1748,14 @@ defmodule PolyxWeb.HomeLive do
     end
   end
 
+  # Maximum trades to show in live feed - keeps the feed focused on recent activity
+  @max_live_feed_items 25
+
   defp collect_live_feed(tracked_users) do
     tracked_users
     |> Enum.flat_map(fn user ->
+      # Take all trades to sort globally, but we'll limit after sorting
       user.trades
-      |> Enum.take(20)
       |> Enum.map(fn trade ->
         %{
           id: trade["id"] || System.unique_integer([:positive]),
@@ -1743,9 +1782,9 @@ defmodule PolyxWeb.HomeLive do
         }
       end)
     end)
-    # Sort by timestamp (most recent first) for activity feed
+    # Sort by timestamp (most recent first) and limit to last 25
     |> Enum.sort_by(& &1.timestamp, :desc)
-    |> Enum.take(50)
+    |> Enum.take(@max_live_feed_items)
   end
 
   defp parse_trade_value(nil), do: 0.0

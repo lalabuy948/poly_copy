@@ -3,9 +3,27 @@ defmodule Polyx.Polymarket.Client do
   HTTP client for Polymarket CLOB API.
 
   Handles L2 authentication (HMAC) for authenticated requests.
+  Includes rate limiting (120 req/min for CLOB, 60 req/min for Data API).
   """
 
   require Logger
+
+  alias Polyx.Polymarket.RateLimiter
+
+  # Disable automatic retries - we handle rate limiting ourselves
+  @req_options [retry: false, receive_timeout: 10_000]
+
+  # Max retries for transient failures
+  @max_retries 3
+
+  # Custom error struct for better error context
+  defmodule APIError do
+    @moduledoc "Structured API error with context"
+    defexception [:message, :status, :endpoint, :reason, :retryable]
+
+    @impl true
+    def message(%{message: msg}), do: msg
+  end
 
   @doc """
   Get trades for a specific user address.
@@ -78,6 +96,61 @@ defmodule Polyx.Polymarket.Client do
   end
 
   @doc """
+  Fetch prices for multiple tokens concurrently.
+  Returns a map of %{token_id => %{mid: price, bid: price, ask: price}}.
+  Uses Task.async_stream for concurrent fetching with backpressure.
+  """
+  def get_prices_bulk(token_ids, opts \\ []) when is_list(token_ids) do
+    max_concurrency = Keyword.get(opts, :max_concurrency, 5)
+
+    results =
+      token_ids
+      |> Task.async_stream(
+        fn token_id ->
+          case get_orderbook(token_id) do
+            {:ok, %{"bids" => bids, "asks" => asks}} ->
+              best_bid = get_best_price(bids)
+              best_ask = get_best_price(asks)
+
+              mid =
+                if best_bid && best_ask, do: (best_bid + best_ask) / 2, else: best_bid || best_ask
+
+              {token_id,
+               %{
+                 best_bid: best_bid,
+                 best_ask: best_ask,
+                 mid: mid,
+                 updated_at: System.system_time(:millisecond)
+               }}
+
+            _ ->
+              {token_id, nil}
+          end
+        end,
+        max_concurrency: max_concurrency,
+        timeout: 10_000,
+        on_timeout: :kill_task
+      )
+      |> Enum.reduce(%{}, fn
+        {:ok, {_token_id, nil}}, acc -> acc
+        {:ok, {token_id, price_data}}, acc -> Map.put(acc, token_id, price_data)
+        {:exit, _reason}, acc -> acc
+      end)
+
+    {:ok, results}
+  end
+
+  defp get_best_price([%{"price" => price} | _]) when is_binary(price) do
+    case Float.parse(price) do
+      {val, _} -> val
+      :error -> nil
+    end
+  end
+
+  defp get_best_price([%{"price" => price} | _]) when is_number(price), do: price
+  defp get_best_price(_), do: nil
+
+  @doc """
   Place an order on Polymarket.
 
   Required params:
@@ -113,50 +186,66 @@ defmodule Polyx.Polymarket.Client do
       order_type = params[:order_type] || params["order_type"] || "GTC"
 
       # Auto-detect neg_risk from orderbook if not provided
-      neg_risk =
+      neg_risk_result =
         case params[:neg_risk] || params["neg_risk"] do
           nil -> detect_neg_risk(token_id)
           value -> value
         end
 
-      Logger.info(
-        "Building order: #{side} #{size} @ #{price} for token #{token_id} (#{order_type}, neg_risk=#{neg_risk})"
-      )
-
-      # Build order opts - include signer_address if using proxy wallet
-      order_opts = [
-        private_key: private_key,
-        wallet_address: wallet_address,
-        neg_risk: neg_risk
-      ]
-
-      order_opts =
-        if signer_address do
-          Keyword.put(order_opts, :signer_address, signer_address)
-        else
-          order_opts
-        end
-
-      case OrderBuilder.build_order(token_id, side, size, price, order_opts) do
-        {:ok, signed_order} ->
-          submit_order(signed_order, order_type)
-
+      case neg_risk_result do
         {:error, reason} ->
-          Logger.error("Failed to build order: #{inspect(reason)}")
-          {:error, reason}
+          Logger.error("Cannot place order: neg_risk detection failed - #{inspect(reason)}")
+          {:error, {:neg_risk_detection_failed, reason}}
+
+        neg_risk when is_boolean(neg_risk) ->
+          Logger.info(
+            "Building order: #{side} #{size} @ #{price} for token #{token_id} (#{order_type}, neg_risk=#{neg_risk})"
+          )
+
+          # Build order opts - include signer_address if using proxy wallet
+          order_opts = [
+            private_key: private_key,
+            wallet_address: wallet_address,
+            neg_risk: neg_risk
+          ]
+
+          order_opts =
+            if signer_address do
+              Keyword.put(order_opts, :signer_address, signer_address)
+            else
+              order_opts
+            end
+
+          case OrderBuilder.build_order(token_id, side, size, price, order_opts) do
+            {:ok, signed_order} ->
+              submit_order(signed_order, order_type)
+
+            {:error, reason} ->
+              Logger.error("Failed to build order: #{inspect(reason)}")
+              {:error, reason}
+          end
       end
     end
   end
 
   defp detect_neg_risk(token_id) do
     case get_orderbook(token_id) do
-      {:ok, %{"neg_risk" => neg_risk}} ->
+      {:ok, %{"neg_risk" => neg_risk}} when is_boolean(neg_risk) ->
         Logger.debug("Auto-detected neg_risk=#{neg_risk} for token #{token_id}")
         neg_risk
 
-      _ ->
-        Logger.warning("Could not detect neg_risk for token #{token_id}, defaulting to false")
-        false
+      {:ok, orderbook} ->
+        # Orderbook returned but no neg_risk field - this is unexpected
+        # Log the response structure for debugging and fail safely
+        Logger.error(
+          "Orderbook missing neg_risk field for token #{token_id}. Response: #{inspect(Map.keys(orderbook))}"
+        )
+
+        {:error, :neg_risk_not_found}
+
+      {:error, reason} ->
+        Logger.error("Failed to fetch orderbook for neg_risk detection: #{inspect(reason)}")
+        {:error, {:orderbook_fetch_failed, reason}}
     end
   end
 
@@ -179,7 +268,7 @@ defmodule Polyx.Polymarket.Client do
     Logger.debug("Submitting order to #{url}")
     Logger.debug("Order body: #{body}")
 
-    case Req.post(url, body: body, headers: headers) do
+    case Req.post(url, [body: body, headers: headers] ++ @req_options) do
       {:ok, %Req.Response{status: 200, body: resp_body}} ->
         Logger.info("Order submitted successfully: #{inspect(resp_body)}")
         {:ok, resp_body}
@@ -216,16 +305,314 @@ defmodule Polyx.Polymarket.Client do
   @doc """
   Get current positions for a user (Data API - public endpoint).
   Returns list of positions with title, outcome, size, price, PnL etc.
+  Uses larger page size for fewer requests.
   """
   def get_positions(address) do
-    data_api_get("/positions", %{user: address})
+    # Use 500 items per page to minimize API calls
+    fetch_all_paginated("/positions", address, 500)
+  end
+
+  @doc """
+  Get closed positions for a user (Data API - public endpoint).
+  Returns list of closed positions with realizedPnl for each.
+  Uses larger page size for fewer requests.
+  """
+  def get_closed_positions(address) do
+    # Use 500 items per page to minimize API calls (was 50, causing many sequential requests)
+    fetch_all_paginated("/closed-positions", address, 500)
+  end
+
+  # Fetch all pages of a paginated endpoint
+  # Stops when receiving a partial page (fewer items than page_size)
+  defp fetch_all_paginated(path, address, page_size, offset \\ 0, acc \\ []) do
+    page_start = System.monotonic_time(:millisecond)
+
+    case data_api_get(path, %{user: address, limit: page_size, offset: offset}) do
+      {:ok, items} when is_list(items) and length(items) == page_size ->
+        # Full page - there might be more
+        page_elapsed = System.monotonic_time(:millisecond) - page_start
+
+        Logger.debug(
+          "[Client] #{path} page at offset=#{offset}: #{length(items)} items in #{page_elapsed}ms"
+        )
+
+        fetch_all_paginated(path, address, page_size, offset + page_size, acc ++ items)
+
+      {:ok, items} when is_list(items) and length(items) > 0 ->
+        # Partial page - this is the last page, no need to fetch more
+        page_elapsed = System.monotonic_time(:millisecond) - page_start
+        total = acc ++ items
+
+        Logger.debug(
+          "[Client] #{path} done: #{length(total)} items (last page: #{length(items)}) in #{page_elapsed}ms"
+        )
+
+        {:ok, total}
+
+      {:ok, items} when is_list(items) ->
+        # Empty page - we're done
+        page_elapsed = System.monotonic_time(:millisecond) - page_start
+
+        Logger.debug(
+          "[Client] #{path} done: #{length(acc)} items (empty page) in #{page_elapsed}ms"
+        )
+
+        {:ok, acc}
+
+      {:error, reason} when acc == [] ->
+        page_elapsed = System.monotonic_time(:millisecond) - page_start
+
+        Logger.warning(
+          "[Client] #{path} failed at offset=#{offset} in #{page_elapsed}ms: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+
+      {:error, reason} ->
+        page_elapsed = System.monotonic_time(:millisecond) - page_start
+
+        Logger.warning(
+          "[Client] #{path} error at offset=#{offset} in #{page_elapsed}ms: #{inspect(reason)}, returning #{length(acc)} items"
+        )
+
+        # Return what we have so far if we hit an error mid-pagination
+        {:ok, acc}
+    end
   end
 
   @doc """
   Get user activity/trades history (Data API - public endpoint).
+  Fetches activities using pagination with a configurable limit.
+
+  Options:
+  - max_activities: Maximum number of activities to fetch (default: 10_000)
+  - on_progress: Optional callback fn(fetched_count) for progress updates
   """
-  def get_activity(address) do
-    data_api_get("/activity", %{user: address})
+  def get_activity(address, opts \\ []) do
+    max_activities = Keyword.get(opts, :max_activities, 10_000)
+    on_progress = Keyword.get(opts, :on_progress)
+
+    fetch_activities_concurrent(address, max_activities, on_progress)
+  end
+
+  # Fetch activities using concurrent requests for speed
+  # Uses a smart probe to avoid unnecessary concurrent requests for small profiles
+  defp fetch_activities_concurrent(address, max_activities, on_progress) do
+    # For small limits, just fetch exactly what we need (non-blocking for background polling)
+    if max_activities <= 500 do
+      Logger.debug("[Client] Small activity fetch, limit=#{max_activities}")
+
+      case data_api_get_nowait("/activity", %{user: address, limit: max_activities, offset: 0}) do
+        {:ok, activities} when is_list(activities) ->
+          if on_progress do
+            on_progress.(%{batch: 1, total_batches: 1, activities: length(activities)})
+          end
+
+          {:ok, activities}
+
+        {:error, :rate_limited} ->
+          # Rate limited - this is expected for background polling, will retry on next poll
+          Logger.debug("[Client] Small activity fetch rate limited, will retry on next poll")
+          {:ok, []}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      fetch_activities_large(address, max_activities, on_progress)
+    end
+  end
+
+  # Fetch large number of activities using concurrent requests
+  defp fetch_activities_large(address, max_activities, on_progress) do
+    page_size = 500
+    # Calculate how many pages we need (at least 1)
+    max_pages = max(1, div(max_activities, page_size))
+
+    Logger.debug(
+      "[Client] Starting activity fetch, max_pages=#{max_pages}, page_size=#{page_size}"
+    )
+
+    # Smart probe: fetch first page (500 items) to determine if we need concurrent fetching
+    probe_start = System.monotonic_time(:millisecond)
+
+    case data_api_get("/activity", %{user: address, limit: page_size, offset: 0}) do
+      {:ok, first_page} when is_list(first_page) ->
+        probe_elapsed = System.monotonic_time(:millisecond) - probe_start
+        count = length(first_page)
+        Logger.info("[Client] Activity probe: #{count} items in #{probe_elapsed}ms")
+
+        cond do
+          count == 0 ->
+            # No activities
+            {:ok, []}
+
+          count < page_size ->
+            # Small profile - we already have all activities from the probe
+            if on_progress do
+              on_progress.(%{batch: 1, total_batches: 1, activities: count})
+            end
+
+            {:ok, first_page}
+
+          true ->
+            # Large profile - need to fetch more pages concurrently
+            # Start from page 1 since we already have page 0
+            total_batches = max(1, ceil((max_pages - 1) / 10))
+
+            if on_progress do
+              on_progress.(%{batch: 0, total_batches: total_batches, activities: count})
+            end
+
+            fetch_remaining_pages(address, max_pages, page_size, first_page, on_progress)
+        end
+
+      {:error, reason} ->
+        probe_elapsed = System.monotonic_time(:millisecond) - probe_start
+        Logger.warning("[Client] Activity probe failed in #{probe_elapsed}ms: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  # Fetch remaining pages (starting from page 1) for large profiles
+  defp fetch_remaining_pages(address, max_pages, page_size, first_page, on_progress) do
+    Logger.debug("[Client] Fetching remaining pages (already have page 0)")
+    fetch_pages_concurrent(address, max_pages, page_size, on_progress, first_page, 1)
+  end
+
+  defp fetch_pages_concurrent(address, max_pages, page_size, on_progress, initial_acc, start_page) do
+    # Fetch pages in batches of 10 concurrent requests
+    batch_size = 10
+    max_retries = 3
+    total_batches = max(1, ceil((max_pages - start_page) / batch_size))
+
+    Logger.debug(
+      "[Client] Starting concurrent page fetch, start_page=#{start_page}, max_pages=#{max_pages}"
+    )
+
+    result =
+      start_page..(max_pages - 1)
+      |> Enum.chunk_every(batch_size)
+      |> Enum.reduce_while({:ok, initial_acc, 0}, fn page_batch, {:ok, acc, batch_num} ->
+        batch_start = System.monotonic_time(:millisecond)
+        Logger.debug("[Client] Fetching batch #{batch_num + 1}, pages #{inspect(page_batch)}")
+
+        # Fetch each page with retries
+        results =
+          page_batch
+          |> Task.async_stream(
+            fn page_num ->
+              offset = page_num * page_size
+              fetch_page_with_retry(address, page_size, offset, max_retries)
+            end,
+            max_concurrency: batch_size,
+            timeout: 60_000,
+            on_timeout: :kill_task
+          )
+          |> Enum.map(fn
+            {:ok, result} -> result
+            {:exit, reason} -> {:error, {:task_exit, reason}}
+          end)
+
+        # Process results - track failed pages
+        {activities, should_stop, failed_pages} =
+          results
+          |> Enum.with_index()
+          |> Enum.reduce({[], false, []}, fn {result, idx}, {acts, stop, failed} ->
+            page_num = Enum.at(page_batch, idx)
+
+            case result do
+              {:ok, page_activities} when is_list(page_activities) ->
+                if length(page_activities) < page_size do
+                  # Last page - we're done after this batch
+                  {acts ++ page_activities, true, failed}
+                else
+                  {acts ++ page_activities, stop, failed}
+                end
+
+              {:ok, _} ->
+                {acts, true, failed}
+
+              {:error, reason} ->
+                Logger.warning(
+                  "Failed to fetch activity page #{page_num} after retries: #{inspect(reason)}"
+                )
+
+                {acts, stop, [page_num | failed]}
+            end
+          end)
+
+        batch_elapsed = System.monotonic_time(:millisecond) - batch_start
+        new_acc = acc ++ activities
+
+        Logger.debug(
+          "[Client] Batch #{batch_num + 1} completed in #{batch_elapsed}ms, " <>
+            "fetched #{length(activities)} activities, total=#{length(new_acc)}, should_stop=#{should_stop}"
+        )
+
+        # Log if we had failed pages
+        if failed_pages != [] do
+          Logger.warning(
+            "Activity fetch had #{length(failed_pages)} failed pages: #{inspect(failed_pages)}"
+          )
+        end
+
+        # Report progress if callback provided (with detailed batch info)
+        if on_progress do
+          on_progress.(%{
+            batch: batch_num + 1,
+            total_batches: total_batches,
+            activities: length(new_acc)
+          })
+        end
+
+        if should_stop or length(new_acc) >= max_pages * page_size do
+          {:halt, {:ok, new_acc}}
+        else
+          {:cont, {:ok, new_acc, batch_num + 1}}
+        end
+      end)
+
+    case result do
+      {:ok, activities} -> {:ok, activities}
+      {:ok, activities, _batch_num} -> {:ok, activities}
+    end
+  end
+
+  # Fetch a single page with exponential backoff retry
+  defp fetch_page_with_retry(address, page_size, offset, retries_left, delay \\ 1000)
+
+  defp fetch_page_with_retry(_address, _page_size, _offset, 0, _delay) do
+    {:error, :max_retries_exceeded}
+  end
+
+  defp fetch_page_with_retry(address, page_size, offset, retries_left, delay) do
+    case data_api_get("/activity", %{user: address, limit: page_size, offset: offset}) do
+      {:ok, _} = success ->
+        success
+
+      {:error, {429, _}} ->
+        # Rate limited - wait longer
+        Logger.debug(
+          "Rate limited fetching activity page at offset #{offset}, retrying in #{delay * 2}ms"
+        )
+
+        Process.sleep(delay * 2)
+        fetch_page_with_retry(address, page_size, offset, retries_left - 1, delay * 2)
+
+      {:error, {status, _}} when status >= 500 ->
+        # Server error - retry with backoff
+        Logger.debug(
+          "Server error #{status} fetching activity page at offset #{offset}, retrying in #{delay}ms"
+        )
+
+        Process.sleep(delay)
+        fetch_page_with_retry(address, page_size, offset, retries_left - 1, delay * 2)
+
+      {:error, _} = error ->
+        # Client error or other - don't retry
+        error
+    end
   end
 
   @doc """
@@ -320,7 +707,14 @@ defmodule Polyx.Polymarket.Client do
   # Private functions
 
   # Authenticated request with L2 headers (HMAC signature)
+  # Rate limited to 120 requests/minute (CLOB bucket)
   defp authenticated_get(path, params) do
+    with :ok <- RateLimiter.acquire(:clob) do
+      do_authenticated_get(path, params, @max_retries)
+    end
+  end
+
+  defp do_authenticated_get(path, params, retries_left) do
     url = build_url(path, params)
     # Timestamp must be in seconds (not milliseconds) to match Python client
     timestamp = System.system_time(:second) |> to_string()
@@ -329,53 +723,169 @@ defmodule Polyx.Polymarket.Client do
       default_headers()
       |> add_l2_auth_headers("GET", path, params, timestamp)
 
-    case Req.get(url, headers: headers) do
+    case Req.get(url, [headers: headers] ++ @req_options) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         {:ok, body}
 
+      {:ok, %Req.Response{status: 429, body: body}} ->
+        handle_rate_limit("CLOB", path, body, retries_left, fn ->
+          do_authenticated_get(path, params, retries_left - 1)
+        end)
+
+      {:ok, %Req.Response{status: status}} when status >= 500 and retries_left > 0 ->
+        Logger.warning("CLOB API server error #{status}, retrying (#{retries_left} left)")
+        Process.sleep(1000)
+        do_authenticated_get(path, params, retries_left - 1)
+
       {:ok, %Req.Response{status: status, body: body}} ->
-        Logger.warning("Polymarket API returned #{status}: #{inspect(body)}")
-        {:error, {status, body}}
+        error = build_api_error("CLOB", path, status, body)
+        Logger.warning("CLOB API error: #{error.message}")
+        {:error, error}
+
+      {:error, %Req.TransportError{reason: reason}} when retries_left > 0 ->
+        Logger.warning("CLOB API transport error: #{inspect(reason)}, retrying")
+        Process.sleep(500)
+        do_authenticated_get(path, params, retries_left - 1)
 
       {:error, reason} ->
-        Logger.error("Polymarket API request failed: #{inspect(reason)}")
-        {:error, reason}
+        error = build_api_error("CLOB", path, nil, reason)
+        Logger.error("CLOB API request failed: #{inspect(reason)}")
+        {:error, error}
     end
   end
 
   # Public request without authentication
+  # Rate limited to 120 requests/minute (CLOB bucket)
   defp public_get(path, params) do
-    url = build_url(path, params)
-
-    case Req.get(url, headers: default_headers()) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        {:ok, body}
-
-      {:ok, %Req.Response{status: status, body: body}} ->
-        Logger.warning("Polymarket API returned #{status}: #{inspect(body)}")
-        {:error, {status, body}}
-
-      {:error, reason} ->
-        Logger.error("Polymarket API request failed: #{inspect(reason)}")
-        {:error, reason}
+    with :ok <- RateLimiter.acquire(:clob) do
+      do_public_get(path, params, @max_retries)
     end
   end
 
-  defp data_api_get(path, params) do
-    url = build_data_api_url(path, params)
+  defp do_public_get(path, params, retries_left) do
+    url = build_url(path, params)
 
-    case Req.get(url, headers: default_headers()) do
+    case Req.get(url, [headers: default_headers()] ++ @req_options) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         {:ok, body}
 
+      {:ok, %Req.Response{status: 429, body: body}} ->
+        handle_rate_limit("CLOB", path, body, retries_left, fn ->
+          do_public_get(path, params, retries_left - 1)
+        end)
+
+      {:ok, %Req.Response{status: status, body: _body}} when status >= 500 and retries_left > 0 ->
+        Logger.warning("CLOB API server error #{status}, retrying (#{retries_left} left)")
+        Process.sleep(1000)
+        do_public_get(path, params, retries_left - 1)
+
       {:ok, %Req.Response{status: status, body: body}} ->
-        Logger.warning("Data API returned #{status}: #{inspect(body)}")
-        {:error, {status, body}}
+        error = build_api_error("CLOB", path, status, body)
+        Logger.warning("CLOB API error: #{error.message}")
+        {:error, error}
+
+      {:error, %Req.TransportError{reason: reason}} when retries_left > 0 ->
+        Logger.warning("CLOB API transport error: #{inspect(reason)}, retrying")
+        Process.sleep(500)
+        do_public_get(path, params, retries_left - 1)
 
       {:error, reason} ->
-        Logger.error("Data API request failed: #{inspect(reason)}")
-        {:error, reason}
+        error = build_api_error("CLOB", path, nil, reason)
+        Logger.error("CLOB API request failed: #{inspect(reason)}")
+        {:error, error}
     end
+  end
+
+  # Data API request (rate limited to 60 requests/minute)
+  defp data_api_get(path, params) do
+    with :ok <- RateLimiter.acquire(:data) do
+      do_data_api_get(path, params, @max_retries)
+    end
+  end
+
+  # Data API request without waiting for rate limiter (for background polling)
+  # Uses try_acquire - if rate limited, fails immediately instead of blocking
+  defp data_api_get_nowait(path, params) do
+    case RateLimiter.try_acquire(:data) do
+      :ok ->
+        do_data_api_get(path, params, @max_retries)
+
+      {:error, :rate_limited} ->
+        {:error, :rate_limited}
+    end
+  end
+
+  defp do_data_api_get(path, params, retries_left) do
+    url = build_data_api_url(path, params)
+
+    case Req.get(url, [headers: default_headers()] ++ @req_options) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        {:ok, body}
+
+      {:ok, %Req.Response{status: 429, body: body}} ->
+        handle_rate_limit("Data API", path, body, retries_left, fn ->
+          do_data_api_get(path, params, retries_left - 1)
+        end)
+
+      {:ok, %Req.Response{status: status, body: _body}} when status >= 500 and retries_left > 0 ->
+        Logger.warning("Data API server error #{status}, retrying (#{retries_left} left)")
+        Process.sleep(1000)
+        do_data_api_get(path, params, retries_left - 1)
+
+      {:ok, %Req.Response{status: status, body: body}} ->
+        error = build_api_error("Data API", path, status, body)
+        Logger.warning("Data API error: #{error.message}")
+        {:error, error}
+
+      {:error, %Req.TransportError{reason: reason}} when retries_left > 0 ->
+        Logger.warning("Data API transport error: #{inspect(reason)}, retrying")
+        Process.sleep(500)
+        do_data_api_get(path, params, retries_left - 1)
+
+      {:error, reason} ->
+        error = build_api_error("Data API", path, nil, reason)
+        Logger.error("Data API request failed: #{inspect(reason)}")
+        {:error, error}
+    end
+  end
+
+  # Handle 429 rate limit responses with backoff
+  defp handle_rate_limit(api_name, path, body, retries_left, retry_fn) do
+    if retries_left > 0 do
+      # Extract retry-after header or use default backoff
+      wait_ms = 2000 * (@max_retries - retries_left + 1)
+
+      Logger.warning(
+        "#{api_name} rate limited on #{path}, waiting #{wait_ms}ms (#{retries_left} retries left)"
+      )
+
+      Process.sleep(wait_ms)
+      retry_fn.()
+    else
+      error = build_api_error(api_name, path, 429, body)
+      Logger.error("#{api_name} rate limit exceeded after retries: #{path}")
+      {:error, error}
+    end
+  end
+
+  # Build structured API error
+  defp build_api_error(api_name, endpoint, status, reason) do
+    retryable = status in [429, 500, 502, 503, 504] or is_nil(status)
+
+    message =
+      case reason do
+        %{"error" => msg} -> "#{api_name} #{endpoint}: #{msg}"
+        msg when is_binary(msg) -> "#{api_name} #{endpoint}: #{msg}"
+        _ -> "#{api_name} #{endpoint}: HTTP #{status || "error"} - #{inspect(reason)}"
+      end
+
+    %APIError{
+      message: message,
+      status: status,
+      endpoint: endpoint,
+      reason: reason,
+      retryable: retryable
+    }
   end
 
   defp add_l2_auth_headers(headers, method, request_path, _params, timestamp) do

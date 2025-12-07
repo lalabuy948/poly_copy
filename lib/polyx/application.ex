@@ -12,9 +12,17 @@ defmodule Polyx.Application do
       Polyx.Repo,
       {Ecto.Migrator, repos: Application.fetch_env!(:polyx, :ecto_repos), skip: false},
       {Phoenix.PubSub, name: Polyx.PubSub},
+      # API rate limiter (must start before clients)
+      Polyx.Polymarket.RateLimiter,
+      # ETS cache owner for Gamma market lookups
+      Polyx.Polymarket.GammaCache,
       # Copy trading GenServers
       Polyx.CopyTrading.TradeWatcher,
       Polyx.CopyTrading.TradeExecutor,
+      # Live orders WebSocket client
+      Polyx.Polymarket.LiveOrders,
+      # Strategy engine (supervisor for strategy runners)
+      {Polyx.Strategies.Engine, []},
       # Start to serve requests, typically the last entry
       PolyxWeb.Endpoint
     ]
