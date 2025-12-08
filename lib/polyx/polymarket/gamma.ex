@@ -51,17 +51,29 @@ defmodule Polyx.Polymarket.Gamma do
 
     case Req.get(url, @req_options) do
       {:ok, %{status: 200, body: [market | _]}} when is_map(market) ->
-        {outcome, price} = get_outcome_and_price_for_token(market, token_id)
+        {outcome, price, opposite_token_id} = get_outcome_and_price_for_token(market, token_id)
+
+        # Get event slug from events array or fall back to market slug
+        event_slug =
+          case market["events"] do
+            [%{"slug" => slug} | _] when is_binary(slug) -> slug
+            _ -> market["slug"] || market["eventSlug"]
+          end
 
         info = %{
           question: market["question"],
           event_title: market["eventTitle"] || market["groupItemTitle"],
-          event_slug: market["eventSlug"],
+          event_slug: event_slug,
+          condition_id: market["conditionId"],
           outcome: outcome,
           price: price,
           image: market["image"],
           # Include end date for time-to-resolution calculations
-          end_date: market["endDate"] || market["endDateIso"]
+          end_date: market["endDate"] || market["endDateIso"],
+          # Include neg_risk for order building
+          neg_risk: market["negRisk"] == true,
+          # Include opposite token for inverse trading
+          opposite_token_id: opposite_token_id
         }
 
         # Cache for 5 minutes
@@ -103,7 +115,7 @@ defmodule Polyx.Polymarket.Gamma do
 
     case Enum.find_index(token_ids, &(&1 == token_id)) do
       nil ->
-        {nil, nil}
+        {nil, nil, nil}
 
       idx ->
         outcome = Enum.at(outcomes, idx)
@@ -124,7 +136,13 @@ defmodule Polyx.Polymarket.Gamma do
               num
           end
 
-        {outcome, price}
+        # Find the opposite token (the other token in the market)
+        opposite_token_id =
+          token_ids
+          |> Enum.reject(&(&1 == token_id))
+          |> List.first()
+
+        {outcome, price, opposite_token_id}
     end
   end
 

@@ -15,11 +15,10 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   import Ecto.Query
 
-  # Polymarket Data API rate limit: 200 requests / 10 seconds
-  # We use 50% of capacity to leave headroom for other operations
-  # With 100 req/10s budget and 3s interval, we can track up to 33 users comfortably
-  @base_poll_interval :timer.seconds(1)
-  @max_requests_per_10s 200
+  # Polymarket Data API rate limit: 60 requests/minute (10 per 10 seconds)
+  # Use 90% capacity for aggressive copy trading
+  @base_poll_interval :timer.seconds(2)
+  @max_requests_per_10s 54
 
   defstruct tracked_users: %{},
             last_trade_ids: %{},
@@ -428,8 +427,12 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
         {:ok, trades}
 
+      {:error, :rate_limited} ->
+        # Expected when polling frequently - will retry on next poll
+        {:error, :rate_limited}
+
       {:error, reason} ->
-        Logger.error("Failed to fetch trades for #{address}: #{inspect(reason)}")
+        Logger.warning("Failed to fetch trades for #{address}: #{inspect(reason)}")
         {:error, reason}
     end
   end

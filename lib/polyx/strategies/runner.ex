@@ -12,10 +12,13 @@ defmodule Polyx.Strategies.Runner do
   alias Polyx.Strategies
   alias Polyx.Strategies.Behaviour
   alias Polyx.Polymarket.LiveOrders
+  alias Polyx.Polymarket.Gamma
 
   @tick_interval 5_000
   @broadcast_throttle_ms 200
   @ets_table :strategy_discovered_tokens
+  # Refresh prices from Gamma API every 10 seconds to catch stale prices
+  @price_refresh_interval 10_000
 
   defstruct [
     :strategy_id,
@@ -23,6 +26,7 @@ defmodule Polyx.Strategies.Runner do
     :module,
     :state,
     :tick_ref,
+    :price_refresh_ref,
     :target_tokens,
     :last_broadcast,
     paused: false
@@ -115,6 +119,9 @@ defmodule Polyx.Strategies.Runner do
 
             # Schedule periodic tick
             tick_ref = Process.send_after(self(), :tick, @tick_interval)
+            # Schedule periodic price refresh from API
+            price_refresh_ref =
+              Process.send_after(self(), :refresh_prices, @price_refresh_interval)
 
             state = %__MODULE__{
               strategy_id: strategy_id,
@@ -122,24 +129,14 @@ defmodule Polyx.Strategies.Runner do
               module: module,
               state: strategy_state,
               tick_ref: tick_ref,
+              price_refresh_ref: price_refresh_ref,
               target_tokens: target_tokens,
               last_broadcast: 0
             }
 
-            # Subscribe to any initially discovered tokens (from auto-discovery during init)
-            initial_discovered = extract_discovered_tokens(strategy_state)
-
-            if MapSet.size(initial_discovered) > 0 do
-              token_list = MapSet.to_list(initial_discovered)
-
-              Logger.info(
-                "[Runner] Subscribing to #{length(token_list)} initially discovered tokens"
-              )
-
-              # Store in ETS for fast non-blocking reads
-              store_discovered_tokens(strategy_id, token_list)
-              LiveOrders.subscribe_to_markets(token_list)
-              broadcast_discovered_tokens(strategy_id, token_list)
+            # Schedule initial discovery async if needed (don't block init)
+            if Map.get(strategy_state, :needs_initial_discovery, false) do
+              send(self(), :initial_discovery)
             end
 
             Logger.info(
@@ -226,6 +223,32 @@ defmodule Polyx.Strategies.Runner do
   end
 
   @impl true
+  def handle_info(:initial_discovery, state) do
+    Logger.info("[Runner] Performing initial discovery...")
+
+    # Call discover function if the module supports it
+    new_state =
+      if function_exported?(state.module, :discover_crypto_markets, 1) do
+        case state.module.discover_crypto_markets(state.state) do
+          {:ok, new_strategy_state, _signals} ->
+            subscribe_to_discovered(state.strategy_id, new_strategy_state)
+            %{state | state: %{new_strategy_state | needs_initial_discovery: false}}
+
+          {:ok, new_strategy_state} ->
+            subscribe_to_discovered(state.strategy_id, new_strategy_state)
+            %{state | state: %{new_strategy_state | needs_initial_discovery: false}}
+
+          _ ->
+            state
+        end
+      else
+        state
+      end
+
+    {:noreply, new_state}
+  end
+
+  @impl true
   def handle_info(:tick, state) do
     old_discovered = extract_discovered_tokens(state.state)
 
@@ -283,6 +306,72 @@ defmodule Polyx.Strategies.Runner do
   end
 
   @impl true
+  def handle_info(:refresh_prices, state) do
+    # Refresh prices from Gamma API for all tracked tokens
+    # This ensures we have fresh prices even if WebSocket is quiet
+    tokens_to_refresh = get_all_tracked_tokens(state)
+
+    state =
+      if tokens_to_refresh != [] do
+        Logger.debug("[Runner] Refreshing prices for #{length(tokens_to_refresh)} tokens")
+
+        # Refresh in batches, properly accumulating state
+        tokens_to_refresh
+        |> Enum.take(20)
+        |> Enum.reduce(state, fn token_id, acc_state ->
+          case Gamma.get_market_by_token(token_id) do
+            {:ok, %{price: price} = info} when not is_nil(price) ->
+              price_data = %{
+                best_bid: info[:price],
+                best_ask: info[:price],
+                outcome: info[:outcome],
+                market_question: info[:question],
+                updated_at: System.system_time(:millisecond)
+              }
+
+              broadcast_price_update(acc_state.strategy_id, token_id, price_data)
+
+              synthetic_order = %{
+                event_type: "price_change",
+                asset_id: token_id,
+                best_bid: info[:price],
+                best_ask: info[:price],
+                outcome: info[:outcome],
+                market_question: info[:question]
+              }
+
+              # Process through strategy - accumulate state properly
+              case acc_state.module.handle_order(synthetic_order, acc_state.state) do
+                {:ok, new_strategy_state, signals} when is_list(signals) and signals != [] ->
+                  Logger.info(
+                    "[Runner] 🎯 Price refresh triggered #{length(signals)} signals for #{info[:question] || token_id}"
+                  )
+
+                  broadcast_live_order(acc_state.strategy_id, synthetic_order, signals)
+                  execute_signals(acc_state.strategy, signals)
+                  %{acc_state | state: new_strategy_state}
+
+                {:ok, new_strategy_state} ->
+                  %{acc_state | state: new_strategy_state}
+
+                _ ->
+                  acc_state
+              end
+
+            _ ->
+              acc_state
+          end
+        end)
+      else
+        state
+      end
+
+    # Schedule next refresh
+    price_refresh_ref = Process.send_after(self(), :refresh_prices, @price_refresh_interval)
+    {:noreply, %{state | price_refresh_ref: price_refresh_ref}}
+  end
+
+  @impl true
   def handle_info(_msg, state) do
     # Ignore unknown messages (batch orders, etc.)
     {:noreply, state}
@@ -291,6 +380,7 @@ defmodule Polyx.Strategies.Runner do
   @impl true
   def terminate(reason, state) do
     if state.tick_ref, do: Process.cancel_timer(state.tick_ref)
+    if state.price_refresh_ref, do: Process.cancel_timer(state.price_refresh_ref)
 
     case reason do
       :normal ->
@@ -306,6 +396,18 @@ defmodule Polyx.Strategies.Runner do
   end
 
   # Private functions
+
+  defp subscribe_to_discovered(strategy_id, strategy_state) do
+    discovered = extract_discovered_tokens(strategy_state)
+
+    if MapSet.size(discovered) > 0 do
+      token_list = MapSet.to_list(discovered)
+      Logger.info("[Runner] Subscribing to #{length(token_list)} discovered tokens")
+      store_discovered_tokens(strategy_id, token_list)
+      broadcast_discovered_tokens(strategy_id, token_list)
+      LiveOrders.subscribe_to_markets(token_list)
+    end
+  end
 
   defp execute_signals(strategy, signals) do
     # Use cached strategy from state - paper_mode is updated via toggle_paper_mode event
@@ -460,6 +562,21 @@ defmodule Polyx.Strategies.Runner do
 
         # Update position tracking
         update_position(strategy, signal)
+
+        # Broadcast live order for UI display (same format as paper orders)
+        broadcast_paper_order(strategy.id, %{
+          id: trade.id,
+          token_id: signal.token_id,
+          action: signal.action,
+          price: signal.price,
+          size: signal.size,
+          reason: signal.reason,
+          status: :submitted,
+          paper_mode: false,
+          order_id: order_id,
+          placed_at: DateTime.utc_now(),
+          metadata: signal[:metadata] || %{}
+        })
 
         Logger.info("[Runner] [LIVE] Order submitted: #{order_id}")
 
@@ -631,6 +748,20 @@ defmodule Polyx.Strategies.Runner do
   end
 
   defp extract_discovered_tokens(_), do: MapSet.new()
+
+  # Get all tokens we should track (configured + discovered)
+  defp get_all_tracked_tokens(state) do
+    configured =
+      case state.target_tokens do
+        :all -> []
+        list when is_list(list) -> list
+        _ -> []
+      end
+
+    discovered = extract_discovered_tokens(state.state) |> MapSet.to_list()
+
+    Enum.uniq(configured ++ discovered)
+  end
 
   # Process order through strategy with throttled UI broadcast
   defp process_order(order, state) do

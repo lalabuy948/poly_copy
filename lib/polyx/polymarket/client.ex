@@ -194,8 +194,8 @@ defmodule Polyx.Polymarket.Client do
 
       case neg_risk_result do
         {:error, reason} ->
-          Logger.error("Cannot place order: neg_risk detection failed - #{inspect(reason)}")
-          {:error, {:neg_risk_detection_failed, reason}}
+          Logger.error("Cannot place order: #{reason}")
+          {:error, reason}
 
         neg_risk when is_boolean(neg_risk) ->
           Logger.info(
@@ -235,17 +235,15 @@ defmodule Polyx.Polymarket.Client do
         neg_risk
 
       {:ok, orderbook} ->
-        # Orderbook returned but no neg_risk field - this is unexpected
-        # Log the response structure for debugging and fail safely
         Logger.error(
           "Orderbook missing neg_risk field for token #{token_id}. Response: #{inspect(Map.keys(orderbook))}"
         )
 
-        {:error, :neg_risk_not_found}
+        {:error, "Market configuration unavailable"}
 
-      {:error, reason} ->
-        Logger.error("Failed to fetch orderbook for neg_risk detection: #{inspect(reason)}")
-        {:error, {:orderbook_fetch_failed, reason}}
+      {:error, _reason} ->
+        Logger.warning("Cannot place order: market closed (no orderbook for #{token_id})")
+        {:error, "Market is closed"}
     end
   end
 

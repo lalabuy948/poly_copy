@@ -379,25 +379,13 @@ defmodule Polyx.CopyTrading.TradeExecutor do
   defp decimal_to_float(%Decimal{} = d), do: Decimal.to_float(d)
   defp decimal_to_float(n) when is_number(n), do: n
 
-  # Format API errors to extract human-readable message
+  # Format errors - prefer string messages, fall back to inspect
+  defp format_error(message) when is_binary(message), do: message
   defp format_error(%Polyx.Polymarket.Client.APIError{message: message}), do: message
-  defp format_error(reason) when is_atom(reason), do: humanize_atom(reason)
-
-  defp format_error({_status, %{"error" => message}}) when is_binary(message), do: message
-  defp format_error({_status, %{error: message}}) when is_binary(message), do: message
-
-  # Handle nested error tuples - extract innermost readable message
-  defp format_error({_outer, inner}) when is_tuple(inner), do: format_error(inner)
-  defp format_error({_outer, %{} = inner}), do: format_error(inner)
-
   defp format_error(%{message: message}) when is_binary(message), do: message
   defp format_error(%{"message" => message}) when is_binary(message), do: message
   defp format_error(%{error: message}) when is_binary(message), do: message
   defp format_error(%{"error" => message}) when is_binary(message), do: message
-
+  defp format_error({_status, %{"error" => message}}) when is_binary(message), do: message
   defp format_error(reason), do: inspect(reason)
-
-  defp humanize_atom(atom) do
-    atom |> Atom.to_string() |> String.replace("_", " ")
-  end
 end

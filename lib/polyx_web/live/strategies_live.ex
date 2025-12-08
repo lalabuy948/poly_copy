@@ -169,52 +169,18 @@ defmodule PolyxWeb.StrategiesLive do
       send(self(), {:fetch_initial_prices, target_tokens})
     end
 
-    # For auto-discovery mode, load discovered tokens immediately from ETS
+    # For auto-discovery mode, fetch discovered tokens asynchronously
     auto_discover = strategy.config["auto_discover_crypto"] == true
     is_running = Engine.running?(id)
 
-    # Load discovered tokens and their prices synchronously for instant display
-    initial_token_prices =
-      if auto_discover and is_running do
-        case Runner.get_discovered_tokens(id) do
-          {:ok, tokens} when tokens != [] ->
-            # Load cached prices from Gamma for each token (fast, from cache)
-            tokens
-            |> Enum.take(100)
-            |> Enum.map(fn token_id ->
-              case Gamma.get_market_by_token(token_id) do
-                {:ok, info} ->
-                  {token_id,
-                   %{
-                     best_bid: info[:price],
-                     best_ask: info[:price],
-                     mid: info[:price],
-                     market_question: info[:question],
-                     event_title: info[:event_title],
-                     event_slug: info[:event_slug],
-                     outcome: info[:outcome],
-                     end_date: info[:end_date],
-                     updated_at: System.system_time(:millisecond)
-                   }}
-
-                _ ->
-                  nil
-              end
-            end)
-            |> Enum.reject(&is_nil/1)
-            |> Map.new()
-
-          _ ->
-            %{}
-        end
-      else
-        %{}
-      end
+    if auto_discover and is_running do
+      send(self(), {:fetch_runner_discovered_tokens, id})
+    end
 
     {:noreply,
      socket
      |> assign(:selected_strategy, %{strategy: strategy, stats: stats})
-     |> assign(:token_prices, initial_token_prices)
+     |> assign(:token_prices, %{})
      |> assign(:paper_orders, [])
      # Reset batch state
      |> assign(:batch_price_updates, %{})
@@ -705,6 +671,7 @@ defmodule PolyxWeb.StrategiesLive do
                  market_question: info[:question],
                  event_title: info[:event_title],
                  event_slug: info[:event_slug],
+                 condition_id: info[:condition_id],
                  outcome: info[:outcome],
                  end_date: info[:end_date],
                  updated_at: System.system_time(:millisecond)
@@ -777,6 +744,7 @@ defmodule PolyxWeb.StrategiesLive do
                  market_question: info[:question],
                  event_title: info[:event_title],
                  event_slug: info[:event_slug],
+                 condition_id: info[:condition_id],
                  outcome: info[:outcome],
                  updated_at: System.system_time(:millisecond)
                }}
@@ -825,6 +793,7 @@ defmodule PolyxWeb.StrategiesLive do
             market_question: new_data[:market_question] || existing[:market_question],
             event_title: existing[:event_title],
             event_slug: existing[:event_slug],
+            condition_id: existing[:condition_id],
             outcome: new_data[:outcome] || existing[:outcome],
             updated_at: new_data[:updated_at] || existing[:updated_at]
           })
@@ -1157,9 +1126,9 @@ defmodule PolyxWeb.StrategiesLive do
 
                 <div class="p-2 max-h-[500px] overflow-y-auto">
                   <%= if map_size(@token_prices) == 0 do %>
-                    <div class="py-4 text-center">
-                      <.icon name="hero-eye" class="size-5 text-base-content/30 mx-auto mb-2" />
-                      <p class="text-base-content/50 text-xs">Waiting for prices...</p>
+                    <div class="py-6 text-center">
+                      <span class="loading loading-spinner loading-sm text-primary"></span>
+                      <p class="text-base-content/50 text-xs mt-2">Discovering markets...</p>
                     </div>
                   <% else %>
                     <div class="space-y-1">
@@ -1179,21 +1148,20 @@ defmodule PolyxWeb.StrategiesLive do
                       >
                         <div class="flex items-center justify-between gap-2">
                           <div class="flex-1 min-w-0">
-                            <%= if price_data[:event_slug] do %>
-                              <a
-                                href={"https://polymarket.com/event/#{price_data[:event_slug]}"}
-                                target="_blank"
-                                class="font-medium truncate text-xs hover:text-primary hover:underline block"
-                              >
+                            <a
+                              href={polymarket_url(price_data)}
+                              target="_blank"
+                              class="font-medium truncate text-xs hover:text-primary group/link flex items-center gap-1"
+                            >
+                              <span class="truncate group-hover/link:underline">
                                 {price_data[:event_title] || price_data[:market_question] ||
                                   short_token_id(token_id)}
-                              </a>
-                            <% else %>
-                              <p class="font-medium truncate text-xs">
-                                {price_data[:event_title] || price_data[:market_question] ||
-                                  short_token_id(token_id)}
-                              </p>
-                            <% end %>
+                              </span>
+                              <.icon
+                                name="hero-arrow-top-right-on-square"
+                                class="size-3 shrink-0 opacity-50 group-hover/link:opacity-100"
+                              />
+                            </a>
                             <div class="flex items-center gap-1 mt-0.5">
                               <span
                                 :if={price_data[:outcome]}
@@ -1643,21 +1611,47 @@ defmodule PolyxWeb.StrategiesLive do
                   </div>
                 </div>
 
-                <%!-- Paper Orders --%>
+                <%!-- Strategy Orders (Paper & Live) --%>
                 <div
-                  :if={
-                    @selected_strategy.strategy.status == "running" and
-                      @selected_strategy.strategy.paper_mode
-                  }
-                  class="rounded-2xl bg-base-200/50 border border-warning/30 overflow-hidden"
+                  :if={@selected_strategy.strategy.status == "running"}
+                  class={[
+                    "rounded-2xl bg-base-200/50 overflow-hidden",
+                    @selected_strategy.strategy.paper_mode && "border border-warning/30",
+                    !@selected_strategy.strategy.paper_mode && "border border-error/30"
+                  ]}
                 >
-                  <div class="px-5 py-4 border-b border-warning/20 bg-warning/5">
+                  <div class={[
+                    "px-5 py-4 border-b",
+                    @selected_strategy.strategy.paper_mode && "border-warning/20 bg-warning/5",
+                    !@selected_strategy.strategy.paper_mode && "border-error/20 bg-error/5"
+                  ]}>
                     <div class="flex items-center justify-between">
                       <div class="flex items-center gap-2">
-                        <.icon name="hero-document-text" class="size-5 text-warning" />
-                        <h2 class="font-semibold">Paper Orders</h2>
-                        <span class="px-2 py-0.5 rounded-full bg-warning/10 text-warning text-xs font-medium">
-                          SIMULATED
+                        <.icon
+                          name={
+                            if @selected_strategy.strategy.paper_mode,
+                              do: "hero-document-text",
+                              else: "hero-bolt-solid"
+                          }
+                          class={
+                            if @selected_strategy.strategy.paper_mode,
+                              do: "size-5 text-warning",
+                              else: "size-5 text-error"
+                          }
+                        />
+                        <h2 class="font-semibold">
+                          {if @selected_strategy.strategy.paper_mode,
+                            do: "Paper Orders",
+                            else: "Live Orders"}
+                        </h2>
+                        <span class={[
+                          "px-2 py-0.5 rounded-full text-xs font-medium",
+                          @selected_strategy.strategy.paper_mode && "bg-warning/10 text-warning",
+                          !@selected_strategy.strategy.paper_mode && "bg-error/10 text-error"
+                        ]}>
+                          {if @selected_strategy.strategy.paper_mode,
+                            do: "SIMULATED",
+                            else: "REAL MONEY"}
                         </span>
                       </div>
                       <p class="text-xs text-base-content/50">{length(@paper_orders)} orders</p>
@@ -1667,13 +1661,27 @@ defmodule PolyxWeb.StrategiesLive do
                   <div class="divide-y divide-base-300/50 max-h-[300px] overflow-y-auto">
                     <%= if @paper_orders == [] do %>
                       <div class="py-8 text-center">
-                        <div class="w-12 h-12 rounded-xl bg-base-300/50 flex items-center justify-center mx-auto mb-3">
+                        <div class={[
+                          "w-12 h-12 rounded-xl flex items-center justify-center mx-auto mb-3",
+                          @selected_strategy.strategy.paper_mode && "bg-warning/10",
+                          !@selected_strategy.strategy.paper_mode && "bg-error/10"
+                        ]}>
                           <.icon
-                            name="hero-clipboard-document-list"
-                            class="size-6 text-base-content/30"
+                            name={
+                              if @selected_strategy.strategy.paper_mode,
+                                do: "hero-clipboard-document-list",
+                                else: "hero-bolt"
+                            }
+                            class={
+                              if @selected_strategy.strategy.paper_mode,
+                                do: "size-6 text-warning/50",
+                                else: "size-6 text-error/50"
+                            }
                           />
                         </div>
-                        <p class="text-base-content/50 text-sm">No paper orders yet</p>
+                        <p class="text-base-content/50 text-sm">
+                          No {if @selected_strategy.strategy.paper_mode, do: "paper", else: "live"} orders yet
+                        </p>
                         <p class="text-base-content/40 text-xs mt-1">
                           Orders will appear when strategy triggers
                         </p>
@@ -1693,8 +1701,12 @@ defmodule PolyxWeb.StrategiesLive do
                               ]}>
                                 {order.action |> to_string() |> String.upcase()}
                               </span>
-                              <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-warning/20 text-warning">
-                                PAPER
+                              <span class={[
+                                "px-1.5 py-0.5 rounded text-[10px] font-semibold",
+                                order[:paper_mode] != false && "bg-warning/20 text-warning",
+                                order[:paper_mode] == false && "bg-error/20 text-error"
+                              ]}>
+                                {if order[:paper_mode] != false, do: "PAPER", else: "LIVE"}
                               </span>
                             </div>
                             <p class="text-sm text-base-content/80">
@@ -1708,8 +1720,10 @@ defmodule PolyxWeb.StrategiesLive do
                                 </span>
                               </span>
                               <span class="text-base-content/60">
-                                <span class="text-base-content/40">Size:</span>
-                                <span class="font-medium">${order.size}</span>
+                                <span class="text-base-content/40">Shares:</span>
+                                <span class="font-medium">
+                                  {format_order_shares(order)}
+                                </span>
                               </span>
                               <span class="text-base-content/40 font-mono text-[10px]">
                                 {short_token_id(order.token_id)}
@@ -1720,6 +1734,7 @@ defmodule PolyxWeb.StrategiesLive do
                             <span class={[
                               "px-2 py-0.5 rounded text-[10px] font-semibold",
                               order.status == :filled && "bg-success/10 text-success",
+                              order.status == :submitted && "bg-info/10 text-info",
                               order.status == :pending && "bg-warning/10 text-warning",
                               order.status == :cancelled && "bg-base-300 text-base-content/50"
                             ]}>
@@ -2273,6 +2288,16 @@ defmodule PolyxWeb.StrategiesLive do
   defp order_side_class(side) when side in ["SELL", "sell", :sell], do: "text-error"
   defp order_side_class(_), do: "text-base-content/60"
 
+  defp polymarket_url(%{event_slug: slug}) when is_binary(slug) and slug != "" do
+    "https://polymarket.com/event/#{slug}"
+  end
+
+  defp polymarket_url(%{condition_id: cid}) when is_binary(cid) and cid != "" do
+    "https://polymarket.com/event?id=#{cid}"
+  end
+
+  defp polymarket_url(_), do: "https://polymarket.com"
+
   defp short_token_id(nil), do: "unknown"
 
   defp short_token_id(token_id) when is_binary(token_id) do
@@ -2296,6 +2321,19 @@ defmodule PolyxWeb.StrategiesLive do
   end
 
   defp format_price_percent(_), do: "-"
+
+  # Format shares - use pre-calculated from metadata if available
+  defp format_order_shares(%{metadata: %{shares: shares}}) when is_number(shares) do
+    Float.round(shares, 1) |> to_string()
+  end
+
+  defp format_order_shares(%{size: size, price: price})
+       when is_number(size) and is_number(price) and price > 0 do
+    shares = size / price
+    Float.round(shares, 1) |> to_string()
+  end
+
+  defp format_order_shares(_), do: "-"
 
   # Outcome styling (Yes/No)
   defp outcome_class("Yes"), do: "bg-success/20 text-success"

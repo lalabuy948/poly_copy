@@ -1,42 +1,25 @@
 defmodule Polyx.Strategies.TimeDecay do
   @moduledoc """
-  Time Decay Strategy - Production Version.
+  Time Decay Strategy - Simple High-Confidence Version.
 
-  This strategy exploits events nearing resolution by placing orders at extreme prices
-  to capture the final price movement to 0 or 1.
+  Simple logic: BUY any token at 90%+ that is close to resolution.
+  - If UP is at 90%+ → BUY UP (it will resolve to $1.00)
+  - If DOWN is at 90%+ → BUY DOWN (it will resolve to $1.00)
 
-  Key features:
-  1. **Time-to-resolution filter** - Only trades markets expiring within configured window
-  2. **YES/NO token differentiation** - Determines likely resolution direction
-  3. **Midpoint price evaluation** - More accurate than best_bid alone
-  4. **Proper buy/sell logic**:
-     - BUY high-priced YES tokens (capture final move to 1)
-     - SELL low-priced YES tokens (profit from decay to 0)
-  5. **Spread/liquidity checks** - Skips illiquid markets
-  6. **Fee-aware sizing** - Accounts for Polymarket fees
-  7. **Profit threshold** - Only signals if estimated profit exceeds minimum
-  8. **Proactive scanning** - Periodically scans for near-expiry opportunities
-  9. **Auto-discovery mode** - Automatically discovers new 15-min crypto markets
-  10. **Crypto-only filter** - Focus exclusively on crypto prediction markets
+  One trade per market - once we buy one side, both tokens go on cooldown.
 
   Config options:
-  - target_high_price: Price to place buy orders near 1 (default: 0.99)
-  - target_low_price: Price to place sell orders near 0 (default: 0.01)
-  - high_threshold: Price above which we consider "high" (default: 0.80)
-  - low_threshold: Price below which we consider "low" (default: 0.20)
+  - high_threshold: Price above which we BUY (default: 0.90)
+  - target_high_price: Limit price for buy orders (default: 0.99)
   - order_size: Base order size in USD (default: 10)
-  - cooldown_seconds: Cooldown between orders per token (default: 300)
+  - cooldown_seconds: Cooldown between orders per market (default: 300)
   - min_spread: Maximum spread to tolerate (default: 0.02)
   - use_midpoint: Use midpoint price instead of best_bid (default: true)
   - max_hours_to_resolution: Only trade markets expiring within N hours (default: 24)
   - max_minutes_to_resolution: For short-term markets, minutes-based filter (default: nil)
   - min_minutes_to_resolution: Minimum minutes before resolution (default: 1)
-  - min_profit: Minimum estimated profit in USD to signal (default: 0.10)
-  - scan_enabled: Enable proactive market scanning (default: false)
-  - scan_limit: Number of markets to scan per tick (default: 20)
-  - crypto_only: Only trade crypto-related markets (default: false)
-  - auto_discover_crypto: Automatically discover and trade 15-min crypto markets (default: false)
-  - discovery_interval_seconds: How often to scan for new crypto markets (default: 30)
+  - min_profit: Minimum estimated profit in USD to signal (default: 0.01)
+  - auto_discover_crypto: Automatically discover 15-min crypto markets (default: false)
   """
   @behaviour Polyx.Strategies.Behaviour
 
@@ -45,7 +28,6 @@ defmodule Polyx.Strategies.TimeDecay do
   alias Polyx.Polymarket.{Gamma, Client}
 
   # Polymarket fee structure
-  @maker_fee 0.001
   @taker_fee 0.002
   @min_order_value 1.0
   @min_shares 5
@@ -73,20 +55,16 @@ defmodule Polyx.Strategies.TimeDecay do
       # Track which tokens we've already evaluated to avoid re-processing
       evaluated_tokens: MapSet.new(),
       # Tokens removed due to resolution (for Runner to broadcast)
-      removed_tokens: []
+      removed_tokens: [],
+      # Flag for async initial discovery
+      needs_initial_discovery: false
     }
 
-    # If auto_discover_crypto is enabled, do initial discovery
+    # If auto_discover_crypto is enabled, mark for initial discovery (done async by Runner)
     state =
       if config["auto_discover_crypto"] == true do
-        Logger.info(
-          "[TimeDecay] Auto-discovery mode enabled, performing initial crypto market scan"
-        )
-
-        case discover_crypto_markets(state) do
-          {:ok, new_state, _signals} -> new_state
-          {:ok, new_state} -> new_state
-        end
+        Logger.info("[TimeDecay] Auto-discovery mode enabled")
+        %{state | needs_initial_discovery: true}
       else
         state
       end
@@ -478,10 +456,10 @@ defmodule Polyx.Strategies.TimeDecay do
 
   defp check_time_decay_opportunity(state, asset_id, best_bid, best_ask, order) do
     config = state.config
-    high_threshold = config["high_threshold"] || 0.80
-    low_threshold = config["low_threshold"] || 0.20
+    high_threshold = config["high_threshold"] || 0.90
+    _low_threshold = config["low_threshold"]  # unused - we only buy at high prices
     target_high_price = config["target_high_price"] || 0.99
-    target_low_price = config["target_low_price"] || 0.01
+    _target_low_price = config["target_low_price"] || 0.01
     order_size = config["order_size"] || 10
     cooldown_seconds = config["cooldown_seconds"] || 300
     min_spread = config["min_spread"] || 0.02
@@ -490,11 +468,12 @@ defmodule Polyx.Strategies.TimeDecay do
     # New: minutes-based filtering for short-term markets
     max_minutes = config["max_minutes_to_resolution"]
     min_minutes = config["min_minutes_to_resolution"] || 1
-    min_profit = config["min_profit"] || 0.10
+    min_profit = config["min_profit"] || 0.01
     crypto_only = config["crypto_only"] == true
 
     # Check cooldown first (fast path)
     if in_cooldown?(state, asset_id) do
+      Logger.debug("[TimeDecay] Skipping #{asset_id} - in cooldown")
       :no_opportunity
     else
       # Calculate price to use
@@ -547,6 +526,13 @@ defmodule Polyx.Strategies.TimeDecay do
             end
         end
 
+      # Log price check for debugging (only for significant prices)
+      if current_price && (current_price > 0.70 || current_price < 0.30) do
+        Logger.debug(
+          "[TimeDecay] Price check: #{Float.round(current_price * 100, 1)}¢ | outcome=#{outcome} | time_ok=#{time_ok} | spread=#{spread && Float.round(spread, 4)} | crypto=#{is_crypto}"
+        )
+      end
+
       cond do
         # Price is nil - can't evaluate
         is_nil(current_price) ->
@@ -564,9 +550,13 @@ defmodule Polyx.Strategies.TimeDecay do
         spread && spread > min_spread * 2 ->
           :no_opportunity
 
-        # HIGH PRICE SCENARIO: YES token likely resolving to 1
-        # BUY to capture final move to 1
-        current_price > high_threshold and outcome in ["Yes", "yes", "YES", nil] ->
+        # Price not high enough - wait for 90%+
+        current_price <= high_threshold ->
+          :no_opportunity
+
+        # HIGH PRICE (90%+): Token likely resolving to 1.0
+        # BUY to capture final move to $1.00
+        current_price > high_threshold ->
           generate_buy_signal(
             state,
             asset_id,
@@ -575,48 +565,10 @@ defmodule Polyx.Strategies.TimeDecay do
             order_size,
             cooldown_seconds,
             min_profit,
-            :high_yes,
+            :high_price,
             market_info,
             order
           )
-
-        # LOW PRICE SCENARIO: YES token likely resolving to 0
-        # SELL to profit from decay to 0 (requires holding shares or neg-risk)
-        current_price < low_threshold and outcome in ["Yes", "yes", "YES", nil] ->
-          generate_sell_signal(
-            state,
-            asset_id,
-            current_price,
-            target_low_price,
-            order_size,
-            cooldown_seconds,
-            min_profit,
-            :low_yes,
-            market_info,
-            order
-          )
-
-        # NO token at HIGH price = YES at LOW price
-        # Sell expensive NO (decays to 0 when YES wins)
-        current_price > high_threshold and outcome in ["No", "no", "NO"] ->
-          generate_sell_signal(
-            state,
-            asset_id,
-            current_price,
-            target_low_price,
-            order_size,
-            cooldown_seconds,
-            min_profit,
-            :high_no,
-            market_info,
-            order
-          )
-
-        # NO token at LOW price = YES at HIGH price
-        # Could buy cheap NO as hedge, but risky - skip for now
-        current_price < low_threshold and outcome in ["No", "no", "NO"] ->
-          # NO token at low price - skip contrarian bet
-          :no_opportunity
 
         true ->
           :no_opportunity
@@ -764,77 +716,23 @@ defmodule Polyx.Strategies.TimeDecay do
         }
 
         Logger.info(
-          "[TimeDecay] 🎯 BUY SIGNAL: #{market_info[:outcome] || "YES"} @ #{pct(current_price)} → #{pct(target_price)}"
+          "[TimeDecay] 🎯 BUY SIGNAL: #{market_info[:outcome] || "YES"} @ #{pct(current_price)} → #{pct(target_price)}, cooldown=#{cooldown_seconds}s"
         )
 
+        # Put BOTH this token AND the opposite token on cooldown (one trade per market)
+        cooldown_until = System.system_time(:second) + cooldown_seconds
+        cooldowns = Map.put(state.cooldowns, asset_id, cooldown_until)
+
         cooldowns =
-          Map.put(state.cooldowns, asset_id, System.system_time(:second) + cooldown_seconds)
+          if opposite_token_id = market_info[:opposite_token_id] do
+            Map.put(cooldowns, opposite_token_id, cooldown_until)
+          else
+            cooldowns
+          end
 
-        placed_orders = Map.put(state.placed_orders, asset_id, signal)
-
-        {:opportunity, signal, %{state | cooldowns: cooldowns, placed_orders: placed_orders}}
-    end
-  end
-
-  # Generate a SELL signal for tokens likely to resolve to 0
-  defp generate_sell_signal(
-         state,
-         asset_id,
-         current_price,
-         target_price,
-         order_size,
-         cooldown_seconds,
-         min_profit,
-         direction,
-         market_info,
-         order
-       ) do
-    # For sells, calculate shares based on current price
-    effective_size = calculate_effective_size(order_size, current_price, :sell)
-    shares = effective_size / current_price
-    estimated_profit = estimate_profit(:sell, current_price, target_price, shares)
-
-    cond do
-      effective_size < @min_order_value ->
-        :no_opportunity
-
-      shares < @min_shares ->
-        :no_opportunity
-
-      estimated_profit < min_profit ->
-        :no_opportunity
-
-      true ->
-        Logger.info(
-          "[TimeDecay] SELL signal: #{asset_id} at #{pct(current_price)}, " <>
-            "target #{pct(target_price)}, est profit $#{Float.round(estimated_profit, 2)} (#{direction})"
+        Logger.debug(
+          "[TimeDecay] Set cooldown for market (both tokens) until #{cooldown_until}"
         )
-
-        signal = %{
-          action: :sell,
-          token_id: asset_id,
-          price: target_price,
-          size: shares,
-          reason:
-            "Time decay SELL - #{market_info[:outcome] || "token"} at #{pct(current_price)} " <>
-              "heading to 0, #{hours_label(market_info)} to resolution",
-          metadata: %{
-            strategy: "time_decay",
-            current_price: current_price,
-            target_price: target_price,
-            direction: direction,
-            outcome: market_info[:outcome],
-            market_question: order.market_question || market_info[:question],
-            end_date: market_info[:end_date],
-            estimated_profit: estimated_profit,
-            shares: shares,
-            # Flag that this requires holding shares or neg-risk
-            requires_position: true
-          }
-        }
-
-        cooldowns =
-          Map.put(state.cooldowns, asset_id, System.system_time(:second) + cooldown_seconds)
 
         placed_orders = Map.put(state.placed_orders, asset_id, signal)
 
@@ -870,21 +768,6 @@ defmodule Polyx.Strategies.TimeDecay do
       {:error, _} ->
         # No info available, assume YES token
         {nil, %{}, state}
-    end
-  end
-
-  # Calculate hours until market resolution
-  defp calculate_hours_to_resolution(nil), do: nil
-
-  defp calculate_hours_to_resolution(end_date) do
-    case parse_end_date(end_date) do
-      {:ok, end_dt} ->
-        now = DateTime.utc_now()
-        hours = DateTime.diff(end_dt, now, :hour)
-        if hours > 0, do: hours, else: 0
-
-      _ ->
-        nil
     end
   end
 
@@ -932,23 +815,12 @@ defmodule Polyx.Strategies.TimeDecay do
     order_size * (1 - @taker_fee)
   end
 
-  defp calculate_effective_size(order_size, _price, :sell) do
-    # For sells, account for potential fees
-    order_size * (1 - @maker_fee)
-  end
-
   # Estimate profit from trade
   defp estimate_profit(:buy, target_price, size) do
     # If resolves to 1, profit = (1 - target_price) * shares - fees
     shares = size / target_price
     gross = (1 - target_price) * shares
     gross * (1 - @taker_fee)
-  end
-
-  defp estimate_profit(:sell, entry_price, exit_price, shares) do
-    # Profit from selling and token going to 0
-    gross = (entry_price - exit_price) * shares
-    gross * (1 - @maker_fee)
   end
 
   defp in_cooldown?(state, token_id) do
@@ -962,12 +834,12 @@ defmodule Polyx.Strategies.TimeDecay do
   defp pct(price) when is_number(price), do: "#{Float.round(price * 100, 1)}%"
   defp pct(_), do: "?%"
 
-  # Format hours to resolution for logging
+  # Format time to resolution for logging (shows minutes when <1h)
   defp hours_label(%{end_date: end_date}) do
-    case calculate_hours_to_resolution(end_date) do
+    case calculate_minutes_to_resolution(end_date) do
       nil -> "unknown time"
-      hours when hours < 1 -> "<1h"
-      hours -> "#{hours}h"
+      mins when mins < 60 -> "#{round(mins)}m"
+      mins -> "#{round(mins / 60)}h"
     end
   end
 

@@ -41,7 +41,10 @@ defmodule Polyx.Polymarket.LiveOrders do
              state: %{subscribed: false, order_batch: [], batch_timer: nil},
              opts: [
                name: {:local, __MODULE__},
-               ping_interval: @ping_interval
+               ping_interval: @ping_interval,
+               # Aggressive reconnection for trading
+               backoff_initial: 500,
+               backoff_max: 5_000
              ]
            ]
          ]},

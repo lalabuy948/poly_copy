@@ -402,10 +402,17 @@ defmodule PolyxWeb.HomeLive do
     # Remove from copied_trade_ids so the trade shows "Copy" button again in live feed
     copied_ids = MapSet.delete(socket.assigns.copied_trade_ids, trade.original_trade_id)
 
+    # Rebuild live feed to show "Copy" button again
+    live_feed =
+      socket.assigns.tracked_users
+      |> collect_live_feed()
+      |> filter_feed(socket.assigns.feed_filter)
+
     {:noreply,
      socket
      |> assign(:copied_trade_ids, copied_ids)
-     |> stream_delete(:copy_trades, trade)}
+     |> stream_delete(:copy_trades, trade)
+     |> stream(:live_feed, live_feed, reset: true)}
   end
 
   @impl true
