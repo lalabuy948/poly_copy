@@ -22,6 +22,7 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   defstruct tracked_users: %{},
             last_trade_ids: %{},
+            in_flight: %{},
             poll_ref: nil
 
   # Client API
@@ -312,32 +313,40 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   @impl true
   def handle_info({:fetch_trades, address}, state) do
-    # Spawn a task to fetch trades asynchronously so GenServer stays responsive
-    parent = self()
+    # Skip if there's already an in-flight request for this address
+    if Map.has_key?(state.in_flight, address) do
+      {:noreply, state}
+    else
+      # Mark as in-flight and spawn task
+      parent = self()
 
-    Task.start(fn ->
-      result = fetch_user_trades(address)
-      send(parent, {:trades_fetched, address, result})
-    end)
+      Task.start(fn ->
+        result = fetch_user_trades(address)
+        send(parent, {:trades_fetched, address, result})
+      end)
 
-    {:noreply, state}
+      {:noreply, %{state | in_flight: Map.put(state.in_flight, address, true)}}
+    end
   end
 
   @impl true
   def handle_info({:trades_fetched, address, {:ok, trades}}, state) do
+    # Clear in-flight flag and process trades
+    state = %{state | in_flight: Map.delete(state.in_flight, address)}
     {:noreply, process_trades(state, address, trades)}
   end
 
   @impl true
-  def handle_info({:trades_fetched, _address, {:error, :rate_limited}}, state) do
-    # Rate limited - silently skip, will retry on next poll
-    {:noreply, state}
+  def handle_info({:trades_fetched, address, {:error, :rate_limited}}, state) do
+    # Rate limited - clear in-flight flag, will retry on next poll
+    {:noreply, %{state | in_flight: Map.delete(state.in_flight, address)}}
   end
 
   @impl true
   def handle_info({:trades_fetched, address, {:error, reason}}, state) do
     Logger.warning("Failed to fetch trades for #{address}: #{inspect(reason)}")
-    {:noreply, state}
+    # Clear in-flight flag so next poll can retry
+    {:noreply, %{state | in_flight: Map.delete(state.in_flight, address)}}
   end
 
   # Private functions
@@ -422,6 +431,12 @@ defmodule Polyx.CopyTrading.TradeWatcher do
               "transactionHash" => act["transactionHash"]
             }
           end)
+          # Sort by size descending THEN deduplicate - ensures we always keep largest
+          # entry for each tx hash regardless of API response order
+          |> Enum.sort_by(fn t -> -(t["size"] || 0) end)
+          |> Enum.uniq_by(& &1["id"])
+          # Re-sort by timestamp descending for chronological display
+          |> Enum.sort_by(fn t -> -(t["timestamp"] || 0) end)
 
         # |> Enum.take(100)
 

@@ -27,6 +27,9 @@ defmodule Polyx.Polymarket.LiveOrders do
   # Max orders to batch before forcing a flush
   @max_batch_size 50
 
+  # ETS table for persisting subscriptions across reconnects
+  @subscriptions_table :live_orders_subscriptions
+
   @doc """
   Child spec for supervisor. Starts the WebSocket client.
   """
@@ -71,14 +74,63 @@ defmodule Polyx.Polymarket.LiveOrders do
   Subscribe to multiple markets by asset IDs.
   """
   def subscribe_to_markets(asset_ids) when is_list(asset_ids) do
+    # Polymarket uses "assets_ids" (plural) and "MARKET" (uppercase)
     msg =
       Jason.encode!(%{
         assets_ids: asset_ids,
-        type: "market"
+        type: "MARKET"
       })
 
     Logger.info("[LiveOrders] Subscribing to #{length(asset_ids)} markets")
-    Fresh.send(__MODULE__, {:text, msg})
+
+    # Store in ETS for re-subscription on reconnect (survives process restarts)
+    store_subscriptions(asset_ids)
+
+    # Use delayed send to ensure connection is ready
+    pid = Process.whereis(__MODULE__)
+
+    if pid do
+      Process.send_after(pid, {:delayed_subscribe, msg}, 200)
+    end
+  end
+
+  # ETS helpers for persistent subscription tracking
+
+  defp ensure_ets_table do
+    case :ets.whereis(@subscriptions_table) do
+      :undefined ->
+        try do
+          :ets.new(@subscriptions_table, [:named_table, :public, :set])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp store_subscriptions(asset_ids) do
+    ensure_ets_table()
+
+    existing =
+      case :ets.lookup(@subscriptions_table, :markets) do
+        [{:markets, set}] -> set
+        [] -> MapSet.new()
+      end
+
+    updated = Enum.reduce(asset_ids, existing, &MapSet.put(&2, &1))
+    :ets.insert(@subscriptions_table, {:markets, updated})
+    Logger.debug("[LiveOrders] Stored #{MapSet.size(updated)} total subscriptions in ETS")
+  end
+
+  defp get_stored_subscriptions do
+    ensure_ets_table()
+
+    case :ets.lookup(@subscriptions_table, :markets) do
+      [{:markets, set}] -> MapSet.to_list(set)
+      [] -> []
+    end
   end
 
   # Fresh callbacks
@@ -87,6 +139,22 @@ defmodule Polyx.Polymarket.LiveOrders do
   def handle_connect(_status, _headers, state) do
     Logger.info("[LiveOrders] Connected to Polymarket WebSocket")
     broadcast({:connected, true})
+
+    # Re-subscribe to previously subscribed markets from ETS after a delay
+    asset_ids = get_stored_subscriptions()
+
+    if asset_ids != [] do
+      Logger.info("[LiveOrders] Will re-subscribe to #{length(asset_ids)} markets in 500ms")
+
+      msg =
+        Jason.encode!(%{
+          assets_ids: asset_ids,
+          type: "MARKET"
+        })
+
+      # Schedule re-subscription after connection is fully established (500ms delay)
+      Process.send_after(self(), {:resubscribe, msg}, 500)
+    end
 
     {:ok, %{state | subscribed: false, order_batch: [], batch_timer: nil}}
   end
@@ -97,6 +165,7 @@ defmodule Polyx.Polymarket.LiveOrders do
     broadcast({:connected, false})
     # Cancel any pending batch timer
     if state.batch_timer, do: Process.cancel_timer(state.batch_timer)
+    # Preserve subscribed_markets for re-subscription on reconnect
     {:reconnect, %{state | subscribed: false, order_batch: [], batch_timer: nil}}
   end
 
@@ -122,11 +191,9 @@ defmodule Polyx.Polymarket.LiveOrders do
           end)
 
         {:ok, %{} = data} when map_size(data) == 0 ->
-          # Empty response, likely acknowledgment
           state
 
         {:ok, "PONG"} ->
-          # Ping response
           state
 
         {:ok, _data} ->
@@ -146,6 +213,21 @@ defmodule Polyx.Polymarket.LiveOrders do
   @impl Fresh
   def handle_info(:flush_batch, state) do
     state = flush_order_batch(state)
+    {:ok, state}
+  end
+
+  def handle_info({:resubscribe, msg}, state) do
+    # Send re-subscription message after reconnect with slight delay
+    Logger.info("[LiveOrders] Sending re-subscription message")
+    # Small delay to ensure connection is fully ready
+    Process.sleep(100)
+    Fresh.send(__MODULE__, {:text, msg})
+    {:ok, state}
+  end
+
+  def handle_info({:delayed_subscribe, msg}, state) do
+    # Delayed subscription for initial connect
+    Fresh.send(__MODULE__, {:text, msg})
     {:ok, state}
   end
 
@@ -205,9 +287,34 @@ defmodule Polyx.Polymarket.LiveOrders do
     end)
   end
 
-  defp handle_event("book", _data, state) do
-    # Full orderbook snapshot - don't broadcast these as they're large
-    state
+  defp handle_event("book", data, state) do
+    # Extract best bid/ask from orderbook snapshot and broadcast as price update
+    asset_id = data["asset_id"]
+    bids = data["bids"] || []
+    asks = data["asks"] || []
+
+    best_bid = get_best_price_from_book(bids)
+    best_ask = get_best_price_from_book(asks)
+
+    if asset_id && (best_bid || best_ask) do
+      market_info = lookup_market_info(asset_id)
+
+      order = %{
+        id: System.unique_integer([:positive, :monotonic]),
+        event_type: "price_change",
+        asset_id: asset_id,
+        best_bid: best_bid,
+        best_ask: best_ask,
+        timestamp: System.system_time(:millisecond),
+        market_question: market_info[:question],
+        event_title: market_info[:event_title],
+        outcome: market_info[:outcome]
+      }
+
+      add_to_batch(order, state)
+    else
+      state
+    end
   end
 
   defp handle_event("tick_size_change", data, state) do
@@ -221,6 +328,17 @@ defmodule Polyx.Polymarket.LiveOrders do
   defp handle_event(_event_type, _data, state) do
     state
   end
+
+  # Helper for extracting best price from orderbook
+  defp get_best_price_from_book([%{"price" => price} | _]) when is_binary(price) do
+    case Float.parse(price) do
+      {val, _} -> val
+      :error -> nil
+    end
+  end
+
+  defp get_best_price_from_book([%{"price" => price} | _]) when is_number(price), do: price
+  defp get_best_price_from_book(_), do: nil
 
   # Batching functions to reduce PubSub overhead
 

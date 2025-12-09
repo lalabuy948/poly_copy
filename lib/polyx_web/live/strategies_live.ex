@@ -5,8 +5,8 @@ defmodule PolyxWeb.StrategiesLive do
   alias Polyx.Strategies.{Engine, Runner, Behaviour, Config}
   alias Polyx.Polymarket.Gamma
 
-  # Batch interval for UI updates (ms)
-  @batch_interval 1000
+  # Batch interval for UI updates (ms) - reduced for more responsive price display
+  @batch_interval 200
 
   @impl true
   def mount(_params, _session, socket) do
@@ -173,15 +173,47 @@ defmodule PolyxWeb.StrategiesLive do
     auto_discover = strategy.config["auto_discover_crypto"] == true
     is_running = Engine.running?(id)
 
+    # Auto-recover crashed strategy: if DB says "running" but Runner is dead, restart it
+    is_running =
+      if strategy.status == "running" and not is_running do
+        require Logger
+
+        Logger.warning(
+          "[StrategiesLive] Strategy #{id} marked running but Runner dead, restarting..."
+        )
+
+        case Engine.start_strategy(id) do
+          {:ok, _pid} ->
+            Logger.info("[StrategiesLive] ✅ Strategy #{id} auto-recovered")
+            true
+
+          {:error, reason} ->
+            Logger.error(
+              "[StrategiesLive] ❌ Failed to restart strategy #{id}: #{inspect(reason)}"
+            )
+
+            false
+        end
+      else
+        is_running
+      end
+
     if auto_discover and is_running do
       send(self(), {:fetch_runner_discovered_tokens, id})
     end
 
+    # Enrich strategy with actual running state (Registry is source of truth)
+    enriched_strategy = %{strategy | status: if(is_running, do: "running", else: "stopped")}
+
+    # Load existing trades from database
+    existing_trades = Strategies.list_trades(id, limit: 50)
+    paper_orders = Enum.map(existing_trades, &trade_to_paper_order/1)
+
     {:noreply,
      socket
-     |> assign(:selected_strategy, %{strategy: strategy, stats: stats})
+     |> assign(:selected_strategy, %{strategy: enriched_strategy, stats: stats})
      |> assign(:token_prices, %{})
-     |> assign(:paper_orders, [])
+     |> assign(:paper_orders, paper_orders)
      # Reset batch state
      |> assign(:batch_price_updates, %{})
      |> assign(:batch_signals, [])
@@ -206,6 +238,21 @@ defmodule PolyxWeb.StrategiesLive do
   @impl true
   def handle_event("clear_activity_log", _params, socket) do
     {:noreply, stream(socket, :events, [], reset: true)}
+  end
+
+  @impl true
+  def handle_event("clear_trades", _params, socket) do
+    if socket.assigns.selected_strategy do
+      strategy_id = socket.assigns.selected_strategy.strategy.id
+      {count, _} = Strategies.delete_trades(strategy_id)
+
+      {:noreply,
+       socket
+       |> assign(:paper_orders, [])
+       |> put_flash(:info, "Deleted #{count} trades")}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
@@ -651,40 +698,63 @@ defmodule PolyxWeb.StrategiesLive do
 
   @impl true
   def handle_info({:fetch_discovered_prices, token_ids}, socket) do
-    # Merge new tokens into existing token_prices (don't replace existing)
-    new_prices =
+    # Filter out tokens we already have prices for
+    tokens_to_fetch =
       token_ids
       |> Enum.reject(fn token_id -> Map.has_key?(socket.assigns.token_prices, token_id) end)
-      |> Enum.chunk_every(10)
-      |> Enum.with_index()
-      |> Enum.flat_map(fn {batch, idx} ->
-        if idx > 0, do: Process.sleep(100)
+      |> Enum.take(100)
 
-        Enum.map(batch, fn token_id ->
-          case Gamma.get_market_by_token(token_id) do
-            {:ok, info} ->
-              {token_id,
-               %{
-                 best_bid: info[:price],
-                 best_ask: info[:price],
-                 mid: info[:price],
-                 market_question: info[:question],
-                 event_title: info[:event_title],
-                 event_slug: info[:event_slug],
-                 condition_id: info[:condition_id],
-                 outcome: info[:outcome],
-                 end_date: info[:end_date],
-                 updated_at: System.system_time(:millisecond)
-               }}
+    if tokens_to_fetch == [] do
+      {:noreply, socket}
+    else
+      # Fetch concurrently in background task, send results back incrementally
+      lv_pid = self()
 
-            _ ->
-              nil
+      Task.start(fn ->
+        tokens_to_fetch
+        |> Task.async_stream(
+          fn token_id ->
+            case Gamma.get_market_by_token(token_id) do
+              {:ok, info} ->
+                {token_id,
+                 %{
+                   best_bid: info[:price],
+                   best_ask: info[:price],
+                   mid: info[:price],
+                   market_question: info[:question],
+                   event_title: info[:event_title],
+                   event_slug: info[:event_slug],
+                   condition_id: info[:condition_id],
+                   outcome: info[:outcome],
+                   end_date: info[:end_date],
+                   updated_at: System.system_time(:millisecond)
+                 }}
+
+              _ ->
+                nil
+            end
+          end,
+          max_concurrency: 10,
+          timeout: 5_000,
+          on_timeout: :kill_task
+        )
+        |> Enum.reduce([], fn
+          {:ok, {token_id, data}}, acc when not is_nil(data) -> [{token_id, data} | acc]
+          _, acc -> acc
+        end)
+        |> then(fn results ->
+          if results != [] do
+            send(lv_pid, {:discovered_prices_batch, Map.new(results)})
           end
         end)
-        |> Enum.reject(&is_nil/1)
       end)
-      |> Map.new()
 
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def handle_info({:discovered_prices_batch, new_prices}, socket) do
     token_prices = Map.merge(socket.assigns.token_prices, new_prices)
     {:noreply, assign(socket, :token_prices, token_prices)}
   end
@@ -696,16 +766,38 @@ defmodule PolyxWeb.StrategiesLive do
 
     case Runner.get_discovered_tokens(strategy_id) do
       {:ok, tokens} when tokens != [] ->
-        Logger.info("[StrategiesLive] Got #{length(tokens)} discovered tokens")
-        # Take first 100 and fetch their prices
+        Logger.info(
+          "[StrategiesLive] Got #{length(tokens)} discovered tokens - showing immediately"
+        )
+
         token_list = Enum.take(tokens, 100)
+
+        # Immediately populate token_prices with placeholder data so spinner dismisses
+        # WebSocket updates will fill in real prices
+        placeholder_prices =
+          token_list
+          |> Enum.map(fn token_id ->
+            {token_id,
+             %{
+               best_bid: nil,
+               best_ask: nil,
+               mid: nil,
+               market_question: "Loading...",
+               outcome: nil,
+               updated_at: System.system_time(:millisecond)
+             }}
+          end)
+          |> Map.new()
+
+        # Fetch full market info in background
         send(self(), {:discovered_tokens, token_list})
+
+        {:noreply, assign(socket, :token_prices, placeholder_prices)}
 
       {:ok, []} ->
         Logger.info("[StrategiesLive] No discovered tokens yet")
+        {:noreply, socket}
     end
-
-    {:noreply, socket}
   end
 
   @impl true
@@ -1107,6 +1199,133 @@ defmodule PolyxWeb.StrategiesLive do
                 </div>
               </div>
 
+              <%!-- Strategy Signals --%>
+              <div
+                :if={@selected_strategy && @selected_strategy.strategy.status == "running"}
+                class="rounded-2xl bg-base-200/50 border border-success/30 overflow-hidden"
+              >
+                <div class="px-5 py-4 border-b border-success/20 bg-success/5">
+                  <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                      <.icon name="hero-bolt-solid" class="size-5 text-success" />
+                      <h2 class="font-semibold">Strategy Signals</h2>
+                      <span class="px-2 py-0.5 rounded-full bg-success/10 text-success text-xs font-medium">
+                        {(@selected_strategy.strategy.paper_mode && "PAPER") || "LIVE"}
+                      </span>
+                    </div>
+                    <p class="text-xs text-base-content/50">Orders triggered by strategy</p>
+                  </div>
+                </div>
+
+                <div
+                  id="live-orders-feed"
+                  phx-update="stream"
+                  class="divide-y divide-base-300/50 max-h-[350px] overflow-y-auto font-mono text-xs"
+                >
+                  <div
+                    id="live-orders-empty"
+                    class="hidden only:block py-8 text-center"
+                  >
+                    <div class="w-12 h-12 rounded-xl bg-success/10 flex items-center justify-center mx-auto mb-3">
+                      <.icon name="hero-bolt" class="size-6 text-success/50" />
+                    </div>
+                    <p class="text-base-content/50 text-sm font-sans">No signals yet</p>
+                    <p class="text-base-content/40 text-xs mt-1 font-sans">
+                      Signals appear when price reaches 0.99 or 0.01
+                    </p>
+                  </div>
+
+                  <div
+                    :for={{id, live_order} <- @streams.live_orders}
+                    id={id}
+                    class="px-4 py-3 bg-success/5 border-l-2 border-success transition-colors"
+                  >
+                    <div class="flex items-start justify-between gap-3">
+                      <div class="flex-1 min-w-0">
+                        <%!-- Event/Market Title --%>
+                        <div class="flex items-center gap-2 mb-1">
+                          <span class={[
+                            "px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0",
+                            order_event_class(live_order.order[:event_type])
+                          ]}>
+                            {String.upcase(live_order.order[:event_type] || "order")}
+                          </span>
+                          <%= if live_order.order[:outcome] do %>
+                            <span class={[
+                              "px-1.5 py-0.5 rounded text-[10px] font-semibold",
+                              outcome_class(live_order.order[:outcome])
+                            ]}>
+                              {live_order.order[:outcome]}
+                            </span>
+                          <% end %>
+                        </div>
+
+                        <%!-- Market Question or Event Title --%>
+                        <p class="text-sm text-base-content/80 truncate leading-tight">
+                          {live_order.order[:market_question] || live_order.order[:event_title] ||
+                            short_token_id(
+                              live_order.order[:asset_id] || live_order.order["asset_id"]
+                            )}
+                        </p>
+
+                        <%!-- Trade Details --%>
+                        <div class="flex items-center gap-3 mt-1.5 text-xs">
+                          <%= if live_order.order[:side] || live_order.order["side"] do %>
+                            <span class={[
+                              "font-semibold",
+                              order_side_class(live_order.order[:side] || live_order.order["side"])
+                            ]}>
+                              {live_order.order[:side] || live_order.order["side"]}
+                            </span>
+                          <% end %>
+                          <%= if live_order.order[:price] || live_order.order["price"] do %>
+                            <span class="text-base-content/60">
+                              <span class="text-base-content/40">Price:</span>
+                              <span class="font-medium text-base-content/80">
+                                {format_price_percent(
+                                  live_order.order[:price] || live_order.order["price"]
+                                )}
+                              </span>
+                            </span>
+                          <% end %>
+                          <%= if live_order.order[:size] || live_order.order["size"] do %>
+                            <span class="text-base-content/60">
+                              <span class="text-base-content/40">Size:</span>
+                              <span class="font-medium text-base-content/80">
+                                ${format_size(live_order.order[:size] || live_order.order["size"])}
+                              </span>
+                            </span>
+                          <% end %>
+                          <%= if live_order.order[:best_bid] && live_order.order[:best_ask] do %>
+                            <span class="text-base-content/40">
+                              Spread: {format_price_percent(live_order.order[:best_bid])}/{format_price_percent(
+                                live_order.order[:best_ask]
+                              )}
+                            </span>
+                          <% end %>
+                        </div>
+                      </div>
+                      <div class="flex flex-col items-end gap-1 shrink-0">
+                        <span class="px-2 py-1 rounded-lg bg-success/10 text-success text-[10px] font-semibold flex items-center gap-1">
+                          <.icon name="hero-bolt-solid" class="size-3" /> SIGNAL
+                        </span>
+                        <span class="text-base-content/30 text-[10px]">
+                          {format_time(live_order.timestamp)}
+                        </span>
+                      </div>
+                    </div>
+                    <%= if live_order.signals do %>
+                      <div class="mt-2 pl-2 border-l border-success/30">
+                        <div :for={signal <- live_order.signals} class="text-success text-[11px]">
+                          {signal.action |> to_string() |> String.upcase()}
+                          {signal.size} @ {Float.round(signal.price, 4)} - {signal.reason}
+                        </div>
+                      </div>
+                    <% end %>
+                  </div>
+                </div>
+              </div>
+
               <%!-- Watched Tokens - Current Prices --%>
               <div
                 :if={@selected_strategy && @selected_strategy.strategy.status == "running"}
@@ -1274,287 +1493,173 @@ defmodule PolyxWeb.StrategiesLive do
                         </button>
                       </div>
 
-                      <%!-- View Mode --%>
+                      <%!-- View Mode - Simplified config display --%>
                       <div
                         :if={!@editing_config}
                         class="p-4 rounded-xl bg-base-100 border border-base-300"
                       >
                         <div class="space-y-3 text-sm">
-                          <%!-- Target Tokens --%>
-                          <div>
-                            <div class="flex items-center justify-between mb-1">
-                              <span class="text-base-content/60 text-xs">Target Markets</span>
-                              <button
-                                type="button"
-                                phx-click="open_market_browser"
-                                class="px-2 py-1 rounded-lg text-xs font-medium text-secondary hover:bg-secondary/10 transition-colors flex items-center gap-1"
-                              >
-                                <.icon name="hero-globe-alt" class="size-3" /> Browse Markets
-                              </button>
+                          <div class="grid grid-cols-2 gap-3">
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Signal Threshold</span>
+                              <span class="font-medium w-20 text-right">
+                                {format_percent(
+                                  @selected_strategy.strategy.config["signal_threshold"] || 0.8
+                                )}
+                              </span>
                             </div>
-                            <div class="mt-1">
-                              <%= if @selected_strategy.strategy.config["watch_all"] do %>
-                                <span class="px-2 py-1 rounded bg-warning/10 text-warning text-xs font-medium">
-                                  Watching ALL tokens
-                                </span>
-                              <% else %>
-                                <% tokens = @selected_strategy.strategy.config["target_tokens"] || [] %>
-                                <%= if tokens == [] do %>
-                                  <span class="text-base-content/40 text-xs">
-                                    No markets configured - click Browse Markets to add
-                                  </span>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Order Size</span>
+                              <span class="font-medium w-20 text-right">
+                                ${@selected_strategy.strategy.config["order_size"] || 5}
+                              </span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Min Minutes</span>
+                              <span class="font-medium w-20 text-right">
+                                {@selected_strategy.strategy.config["min_minutes"] || 1}
+                              </span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Cooldown</span>
+                              <span class="font-medium w-20 text-right">
+                                {@selected_strategy.strategy.config["cooldown_seconds"] || 60}s
+                              </span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Order Type</span>
+                              <span class="font-medium w-20 text-right">
+                                <%= if @selected_strategy.strategy.config["use_limit_order"] != false do %>
+                                  Limit
                                 <% else %>
-                                  <div class="flex flex-wrap gap-1">
-                                    <span class="px-2 py-0.5 rounded bg-secondary/10 text-secondary text-xs font-medium">
-                                      {length(tokens)} token(s) selected
-                                    </span>
-                                  </div>
+                                  Market
                                 <% end %>
-                              <% end %>
+                              </span>
                             </div>
-                          </div>
-                          <%!-- Other Config --%>
-                          <div class="grid grid-cols-2 gap-3 pt-2 border-t border-base-300">
                             <div
-                              :for={{key, value} <- @selected_strategy.strategy.config}
-                              :if={key not in ["target_tokens", "watch_all", "target_markets"]}
-                              class="flex justify-between"
+                              :if={@selected_strategy.strategy.config["use_limit_order"] != false}
+                              class="flex justify-between items-center"
                             >
-                              <span class="text-base-content/60">{humanize_key(key)}</span>
-                              <span class="font-medium">{format_config_value(value)}</span>
+                              <span class="text-base-content/60">Limit Price</span>
+                              <span class="font-medium font-mono w-20 text-right">
+                                {format_price_precise(
+                                  @selected_strategy.strategy.config["limit_price"] || 0.99
+                                )}
+                              </span>
                             </div>
                           </div>
                         </div>
                       </div>
 
-                      <%!-- Edit Mode --%>
+                      <%!-- Edit Mode - Compact inline form matching view style --%>
                       <.form
                         :if={@editing_config}
                         for={@config_form}
                         phx-change="validate_config"
                         phx-submit="save_config"
                         id="strategy-config-form"
-                        class="p-4 rounded-xl bg-base-100 border border-primary/30 space-y-4"
+                        class="p-4 rounded-xl bg-base-100 border border-primary/30"
                       >
-                        <%!-- Auto-Discover Crypto Toggle (MAIN FEATURE) --%>
-                        <div class="p-3 rounded-lg bg-secondary/5 border border-secondary/20">
-                          <div class="flex items-center gap-3">
-                            <.input
-                              field={@config_form[:auto_discover_crypto]}
-                              type="checkbox"
-                              label="Auto-Discover 15-Min Crypto"
-                              class="checkbox checkbox-secondary"
-                            />
-                          </div>
-                          <p class="text-xs text-base-content/50 ml-7 mt-1">
-                            Automatically find and trade crypto markets ending soon
-                          </p>
-                        </div>
-
-                        <%!-- Boolean Toggles Section --%>
-                        <div class="grid grid-cols-2 gap-3">
-                          <div class="flex items-center gap-2">
-                            <.input
-                              field={@config_form[:crypto_only]}
-                              type="checkbox"
-                              label="Crypto Only"
-                              class="checkbox checkbox-info checkbox-sm"
-                            />
-                          </div>
-                          <div class="flex items-center gap-2">
-                            <.input
-                              field={@config_form[:scan_enabled]}
-                              type="checkbox"
-                              label="Scan Enabled"
-                              class="checkbox checkbox-success checkbox-sm"
-                            />
-                          </div>
-                          <div class="flex items-center gap-2">
-                            <.input
-                              field={@config_form[:use_midpoint]}
-                              type="checkbox"
-                              label="Use Midpoint"
-                              class="checkbox checkbox-sm"
-                            />
-                          </div>
-                          <div class="flex items-center gap-2">
-                            <.input
-                              field={@config_form[:watch_all]}
-                              type="checkbox"
-                              label="Watch All (High Volume!)"
-                              class="checkbox checkbox-warning checkbox-sm"
-                            />
-                          </div>
-                        </div>
-
-                        <%!-- Price Thresholds Section --%>
-                        <div class="border-t border-base-300 pt-4">
-                          <h4 class="text-xs font-semibold text-base-content/60 mb-3">
-                            Price Thresholds
-                          </h4>
+                        <div class="space-y-3 text-sm">
                           <div class="grid grid-cols-2 gap-3">
-                            <.input
-                              field={@config_form[:high_threshold]}
-                              type="number"
-                              label="High Threshold"
-                              step="0.01"
-                              min="0.5"
-                              max="1.0"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:low_threshold]}
-                              type="number"
-                              label="Low Threshold"
-                              step="0.01"
-                              min="0"
-                              max="0.5"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:target_high_price]}
-                              type="number"
-                              label="Target High Price"
-                              step="0.01"
-                              min="0.9"
-                              max="1.0"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:target_low_price]}
-                              type="number"
-                              label="Target Low Price"
-                              step="0.01"
-                              min="0"
-                              max="0.1"
-                              class="input input-bordered input-sm w-full"
-                            />
+                            <%!-- Signal Threshold --%>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Signal Threshold</span>
+                              <input
+                                type="number"
+                                name={@config_form[:signal_threshold].name}
+                                value={Phoenix.HTML.Form.input_value(@config_form, :signal_threshold)}
+                                step="0.01"
+                                min="0.50"
+                                max="0.99"
+                                class="w-20 px-2 py-1 text-right font-medium rounded border border-base-300 bg-base-200 focus:border-primary focus:outline-none text-sm"
+                              />
+                            </div>
+                            <%!-- Order Size --%>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Order Size</span>
+                              <input
+                                type="number"
+                                name={@config_form[:order_size].name}
+                                value={Phoenix.HTML.Form.input_value(@config_form, :order_size)}
+                                step="1"
+                                min="1"
+                                class="w-20 px-2 py-1 text-right font-medium rounded border border-base-300 bg-base-200 focus:border-primary focus:outline-none text-sm"
+                              />
+                            </div>
+                            <%!-- Min Minutes --%>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Min Minutes</span>
+                              <input
+                                type="number"
+                                name={@config_form[:min_minutes].name}
+                                value={Phoenix.HTML.Form.input_value(@config_form, :min_minutes)}
+                                step="0.5"
+                                min="0"
+                                class="w-20 px-2 py-1 text-right font-medium rounded border border-base-300 bg-base-200 focus:border-primary focus:outline-none text-sm"
+                              />
+                            </div>
+                            <%!-- Cooldown --%>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Cooldown (s)</span>
+                              <input
+                                type="number"
+                                name={@config_form[:cooldown_seconds].name}
+                                value={Phoenix.HTML.Form.input_value(@config_form, :cooldown_seconds)}
+                                step="1"
+                                min="0"
+                                class="w-20 px-2 py-1 text-right font-medium rounded border border-base-300 bg-base-200 focus:border-primary focus:outline-none text-sm"
+                              />
+                            </div>
+                            <%!-- Use Limit Order --%>
+                            <div class="flex justify-between items-center">
+                              <span class="text-base-content/60">Order Type</span>
+                              <label class="flex items-center gap-2 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  name={@config_form[:use_limit_order].name}
+                                  value="true"
+                                  checked={
+                                    Phoenix.HTML.Form.input_value(@config_form, :use_limit_order)
+                                  }
+                                  class="checkbox checkbox-primary checkbox-sm"
+                                />
+                                <span class="text-xs">Limit</span>
+                              </label>
+                            </div>
+                            <%!-- Limit Price (shown when limit order enabled) --%>
+                            <div
+                              :if={Phoenix.HTML.Form.input_value(@config_form, :use_limit_order)}
+                              class="flex justify-between items-center"
+                            >
+                              <span class="text-base-content/60">Limit Price</span>
+                              <input
+                                type="number"
+                                name={@config_form[:limit_price].name}
+                                value={Phoenix.HTML.Form.input_value(@config_form, :limit_price)}
+                                step="0.0001"
+                                min="0.90"
+                                max="1.0"
+                                class="w-24 px-2 py-1 text-right font-mono font-medium rounded border border-base-300 bg-base-200 focus:border-primary focus:outline-none text-sm"
+                              />
+                            </div>
                           </div>
-                        </div>
-
-                        <%!-- Order Settings Section --%>
-                        <div class="border-t border-base-300 pt-4">
-                          <h4 class="text-xs font-semibold text-base-content/60 mb-3">
-                            Order Settings
-                          </h4>
-                          <div class="grid grid-cols-2 gap-3">
-                            <.input
-                              field={@config_form[:order_size]}
-                              type="number"
-                              label="Order Size ($)"
-                              step="1"
-                              min="1"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:cooldown_seconds]}
-                              type="number"
-                              label="Cooldown (sec)"
-                              step="1"
-                              min="0"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:min_spread]}
-                              type="number"
-                              label="Min Spread"
-                              step="0.01"
-                              min="0"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:min_profit]}
-                              type="number"
-                              label="Min Profit ($)"
-                              step="0.01"
-                              min="0"
-                              class="input input-bordered input-sm w-full"
-                            />
+                          <%!-- Actions --%>
+                          <div class="flex gap-2 pt-3 border-t border-base-300">
+                            <button
+                              type="submit"
+                              class="flex-1 px-3 py-1.5 rounded-lg bg-primary text-primary-content font-medium text-xs hover:bg-primary/90 transition-colors"
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              phx-click="cancel_edit_config"
+                              class="px-3 py-1.5 rounded-lg bg-base-300 text-base-content font-medium text-xs hover:bg-base-300/80 transition-colors"
+                            >
+                              Cancel
+                            </button>
                           </div>
-                        </div>
-
-                        <%!-- Time Settings Section --%>
-                        <div class="border-t border-base-300 pt-4">
-                          <h4 class="text-xs font-semibold text-base-content/60 mb-3">
-                            Time to Resolution
-                          </h4>
-                          <div class="grid grid-cols-3 gap-3">
-                            <.input
-                              field={@config_form[:max_hours_to_resolution]}
-                              type="number"
-                              label="Max Hours"
-                              step="1"
-                              min="1"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:max_minutes_to_resolution]}
-                              type="number"
-                              label="Max Minutes"
-                              step="1"
-                              min="1"
-                              placeholder="nil = use hours"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:min_minutes_to_resolution]}
-                              type="number"
-                              label="Min Minutes"
-                              step="1"
-                              min="0"
-                              class="input input-bordered input-sm w-full"
-                            />
-                          </div>
-                        </div>
-
-                        <%!-- Scanning Settings Section --%>
-                        <div class="border-t border-base-300 pt-4">
-                          <h4 class="text-xs font-semibold text-base-content/60 mb-3">
-                            Scanning Settings
-                          </h4>
-                          <div class="grid grid-cols-3 gap-3">
-                            <.input
-                              field={@config_form[:scan_interval_seconds]}
-                              type="number"
-                              label="Scan Interval (sec)"
-                              step="1"
-                              min="10"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:scan_limit]}
-                              type="number"
-                              label="Scan Limit"
-                              step="1"
-                              min="1"
-                              class="input input-bordered input-sm w-full"
-                            />
-                            <.input
-                              field={@config_form[:discovery_interval_seconds]}
-                              type="number"
-                              label="Discovery Interval (sec)"
-                              step="1"
-                              min="10"
-                              class="input input-bordered input-sm w-full"
-                            />
-                          </div>
-                        </div>
-
-                        <%!-- Actions --%>
-                        <div class="flex gap-2 pt-2 border-t border-base-300">
-                          <button
-                            type="submit"
-                            class="flex-1 px-4 py-2 rounded-lg bg-primary text-primary-content font-medium text-sm hover:bg-primary/90 transition-colors"
-                          >
-                            Save Config
-                          </button>
-                          <button
-                            type="button"
-                            phx-click="cancel_edit_config"
-                            class="px-4 py-2 rounded-lg bg-base-300 text-base-content font-medium text-sm hover:bg-base-300/80 transition-colors"
-                          >
-                            Cancel
-                          </button>
                         </div>
                       </.form>
                     </div>
@@ -1654,7 +1759,18 @@ defmodule PolyxWeb.StrategiesLive do
                             else: "REAL MONEY"}
                         </span>
                       </div>
-                      <p class="text-xs text-base-content/50">{length(@paper_orders)} orders</p>
+                      <div class="flex items-center gap-3">
+                        <p class="text-xs text-base-content/50">{length(@paper_orders)} orders</p>
+                        <%= if @paper_orders != [] do %>
+                          <button
+                            phx-click="clear_trades"
+                            data-confirm="Delete all trades for this strategy?"
+                            class="text-xs text-error/70 hover:text-error transition-colors"
+                          >
+                            Clear all
+                          </button>
+                        <% end %>
+                      </div>
                     </div>
                   </div>
 
@@ -1716,7 +1832,7 @@ defmodule PolyxWeb.StrategiesLive do
                               <span class="text-base-content/60">
                                 <span class="text-base-content/40">Price:</span>
                                 <span class="font-medium font-mono">
-                                  {format_price_percent(order.price)}
+                                  {format_price_precise(order.price)}
                                 </span>
                               </span>
                               <span class="text-base-content/60">
@@ -1747,133 +1863,6 @@ defmodule PolyxWeb.StrategiesLive do
                         </div>
                       </div>
                     <% end %>
-                  </div>
-                </div>
-
-                <%!-- Our Strategy Orders --%>
-                <div
-                  :if={@selected_strategy.strategy.status == "running"}
-                  class="rounded-2xl bg-base-200/50 border border-success/30 overflow-hidden"
-                >
-                  <div class="px-5 py-4 border-b border-success/20 bg-success/5">
-                    <div class="flex items-center justify-between">
-                      <div class="flex items-center gap-2">
-                        <.icon name="hero-bolt-solid" class="size-5 text-success" />
-                        <h2 class="font-semibold">Strategy Signals</h2>
-                        <span class="px-2 py-0.5 rounded-full bg-success/10 text-success text-xs font-medium">
-                          {(@selected_strategy.strategy.paper_mode && "PAPER") || "LIVE"}
-                        </span>
-                      </div>
-                      <p class="text-xs text-base-content/50">Orders triggered by strategy</p>
-                    </div>
-                  </div>
-
-                  <div
-                    id="live-orders-feed"
-                    phx-update="stream"
-                    class="divide-y divide-base-300/50 max-h-[350px] overflow-y-auto font-mono text-xs"
-                  >
-                    <div
-                      id="live-orders-empty"
-                      class="hidden only:block py-8 text-center"
-                    >
-                      <div class="w-12 h-12 rounded-xl bg-success/10 flex items-center justify-center mx-auto mb-3">
-                        <.icon name="hero-bolt" class="size-6 text-success/50" />
-                      </div>
-                      <p class="text-base-content/50 text-sm font-sans">No signals yet</p>
-                      <p class="text-base-content/40 text-xs mt-1 font-sans">
-                        Signals appear when price reaches 0.99 or 0.01
-                      </p>
-                    </div>
-
-                    <div
-                      :for={{id, live_order} <- @streams.live_orders}
-                      id={id}
-                      class="px-4 py-3 bg-success/5 border-l-2 border-success transition-colors"
-                    >
-                      <div class="flex items-start justify-between gap-3">
-                        <div class="flex-1 min-w-0">
-                          <%!-- Event/Market Title --%>
-                          <div class="flex items-center gap-2 mb-1">
-                            <span class={[
-                              "px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0",
-                              order_event_class(live_order.order[:event_type])
-                            ]}>
-                              {String.upcase(live_order.order[:event_type] || "order")}
-                            </span>
-                            <%= if live_order.order[:outcome] do %>
-                              <span class={[
-                                "px-1.5 py-0.5 rounded text-[10px] font-semibold",
-                                outcome_class(live_order.order[:outcome])
-                              ]}>
-                                {live_order.order[:outcome]}
-                              </span>
-                            <% end %>
-                          </div>
-
-                          <%!-- Market Question or Event Title --%>
-                          <p class="text-sm text-base-content/80 truncate leading-tight">
-                            {live_order.order[:market_question] || live_order.order[:event_title] ||
-                              short_token_id(
-                                live_order.order[:asset_id] || live_order.order["asset_id"]
-                              )}
-                          </p>
-
-                          <%!-- Trade Details --%>
-                          <div class="flex items-center gap-3 mt-1.5 text-xs">
-                            <%= if live_order.order[:side] || live_order.order["side"] do %>
-                              <span class={[
-                                "font-semibold",
-                                order_side_class(live_order.order[:side] || live_order.order["side"])
-                              ]}>
-                                {live_order.order[:side] || live_order.order["side"]}
-                              </span>
-                            <% end %>
-                            <%= if live_order.order[:price] || live_order.order["price"] do %>
-                              <span class="text-base-content/60">
-                                <span class="text-base-content/40">Price:</span>
-                                <span class="font-medium text-base-content/80">
-                                  {format_price_percent(
-                                    live_order.order[:price] || live_order.order["price"]
-                                  )}
-                                </span>
-                              </span>
-                            <% end %>
-                            <%= if live_order.order[:size] || live_order.order["size"] do %>
-                              <span class="text-base-content/60">
-                                <span class="text-base-content/40">Size:</span>
-                                <span class="font-medium text-base-content/80">
-                                  ${format_size(live_order.order[:size] || live_order.order["size"])}
-                                </span>
-                              </span>
-                            <% end %>
-                            <%= if live_order.order[:best_bid] && live_order.order[:best_ask] do %>
-                              <span class="text-base-content/40">
-                                Spread: {format_price_percent(live_order.order[:best_bid])}/{format_price_percent(
-                                  live_order.order[:best_ask]
-                                )}
-                              </span>
-                            <% end %>
-                          </div>
-                        </div>
-                        <div class="flex flex-col items-end gap-1 shrink-0">
-                          <span class="px-2 py-1 rounded-lg bg-success/10 text-success text-[10px] font-semibold flex items-center gap-1">
-                            <.icon name="hero-bolt-solid" class="size-3" /> SIGNAL
-                          </span>
-                          <span class="text-base-content/30 text-[10px]">
-                            {format_time(live_order.timestamp)}
-                          </span>
-                        </div>
-                      </div>
-                      <%= if live_order.signals do %>
-                        <div class="mt-2 pl-2 border-l border-success/30">
-                          <div :for={signal <- live_order.signals} class="text-success text-[11px]">
-                            {signal.action |> to_string() |> String.upcase()}
-                            {signal.size} @ {Float.round(signal.price, 4)} - {signal.reason}
-                          </div>
-                        </div>
-                      <% end %>
-                    </div>
                   </div>
                 </div>
 
@@ -2263,17 +2252,8 @@ defmodule PolyxWeb.StrategiesLive do
   defp event_type_icon("error"), do: "hero-exclamation-triangle"
   defp event_type_icon(_), do: "hero-document"
 
-  defp humanize_key(key) when is_binary(key) do
-    key
-    |> String.replace("_", " ")
-    |> String.split(" ")
-    |> Enum.map(&String.capitalize/1)
-    |> Enum.join(" ")
-  end
-
-  defp format_config_value(value) when is_float(value), do: Float.round(value, 4)
-  defp format_config_value(value) when is_list(value), do: "#{length(value)} items"
-  defp format_config_value(value), do: value
+  defp format_percent(value) when is_number(value), do: "#{round(value * 100)}%"
+  defp format_percent(_), do: "—"
 
   defp format_datetime(%DateTime{} = dt), do: Calendar.strftime(dt, "%H:%M:%S")
   defp format_datetime(_), do: ""
@@ -2322,6 +2302,12 @@ defmodule PolyxWeb.StrategiesLive do
 
   defp format_price_percent(_), do: "-"
 
+  # Format price with high precision (4 decimal places)
+  defp format_price_precise(price) when is_number(price),
+    do: :erlang.float_to_binary(price * 1.0, decimals: 4)
+
+  defp format_price_precise(_), do: "-"
+
   # Format shares - use pre-calculated from metadata if available
   defp format_order_shares(%{metadata: %{shares: shares}}) when is_number(shares) do
     Float.round(shares, 1) |> to_string()
@@ -2354,6 +2340,34 @@ defmodule PolyxWeb.StrategiesLive do
   defp format_time(%DateTime{} = dt), do: Calendar.strftime(dt, "%H:%M:%S")
   defp format_time(_), do: ""
 
+  # Convert a Trade struct to the paper_order format expected by the UI
+  defp trade_to_paper_order(%Polyx.Trades.Trade{} = trade) do
+    %{
+      id: trade.id,
+      token_id: trade.asset_id,
+      action: side_to_action(trade.side),
+      price: decimal_to_float(trade.price),
+      size: decimal_to_float(trade.size),
+      reason: trade.title,
+      status: String.to_existing_atom(trade.status),
+      paper_mode: trade.order_id && String.starts_with?(trade.order_id || "", "paper_"),
+      order_id: trade.order_id,
+      placed_at: trade.inserted_at,
+      metadata: %{
+        market_question: trade.title,
+        outcome: trade.outcome
+      }
+    }
+  end
+
+  defp side_to_action("BUY"), do: :buy
+  defp side_to_action("SELL"), do: :sell
+  defp side_to_action(_), do: :buy
+
+  defp decimal_to_float(nil), do: 0.0
+  defp decimal_to_float(%Decimal{} = d), do: Decimal.to_float(d)
+  defp decimal_to_float(n) when is_number(n), do: n * 1.0
+
   # Market browser helpers
   defp event_selected?(selected_tokens, event) do
     Enum.any?(event.token_ids, &(&1 in selected_tokens))
@@ -2372,10 +2386,10 @@ defmodule PolyxWeb.StrategiesLive do
   # Sort tokens by absolute distance from current price to target price
   # |target - current| - smaller distance = closer to filling = higher priority
   defp sort_by_target_proximity(token_prices, config) do
-    high_threshold = config["high_threshold"] || 0.80
-    low_threshold = config["low_threshold"] || 0.20
-    target_high = config["target_high_price"] || 0.99
-    target_low = config["target_low_price"] || 0.01
+    high_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
+    low_threshold = 0.20
+    target_high = config["limit_price"] || config["target_high_price"] || 0.99
+    target_low = 0.01
 
     token_prices
     |> Enum.sort_by(fn {_token_id, price_data} ->
@@ -2402,12 +2416,11 @@ defmodule PolyxWeb.StrategiesLive do
 
   # Price status helpers for Time Decay strategy
   defp price_row_class(price, config) when is_number(price) do
-    high_threshold = config["high_threshold"] || 0.80
-    low_threshold = config["low_threshold"] || 0.20
+    high_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
 
     cond do
       price > high_threshold -> "bg-success/10 border-success/30"
-      price < low_threshold -> "bg-error/10 border-error/30"
+      price < 0.20 -> "bg-error/10 border-error/30"
       true -> "bg-base-100 border-base-300"
     end
   end
@@ -2415,12 +2428,11 @@ defmodule PolyxWeb.StrategiesLive do
   defp price_row_class(_, _), do: "bg-base-100 border-base-300"
 
   defp price_status_text_class(price, config) when is_number(price) do
-    high_threshold = config["high_threshold"] || 0.80
-    low_threshold = config["low_threshold"] || 0.20
+    high_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
 
     cond do
       price > high_threshold -> "text-success"
-      price < low_threshold -> "text-error"
+      price < 0.20 -> "text-error"
       true -> "text-base-content/40"
     end
   end
@@ -2428,14 +2440,12 @@ defmodule PolyxWeb.StrategiesLive do
   defp price_status_text_class(_, _), do: "text-base-content/40"
 
   defp price_status_label(price, config) when is_number(price) do
-    high_threshold = config["high_threshold"] || 0.80
-    low_threshold = config["low_threshold"] || 0.20
-    target_high = config["target_high_price"] || 0.99
-    target_low = config["target_low_price"] || 0.01
+    high_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
+    target_high = config["limit_price"] || config["target_high_price"] || 0.99
 
     cond do
       price > high_threshold -> "TARGET #{Float.round(target_high * 100, 0)}¢"
-      price < low_threshold -> "TARGET #{Float.round(target_low * 100, 0)}¢"
+      price < 0.20 -> "TARGET 1¢"
       true -> "WAIT"
     end
   end

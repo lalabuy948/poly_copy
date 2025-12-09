@@ -17,7 +17,7 @@ if config_env() == :prod do
   default_db_path =
     case System.get_env("__BURRITO_BIN_PATH") do
       nil ->
-        "./polyx.db"
+        "./polyx_dev.db"
 
       binary_path ->
         binary_path

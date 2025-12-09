@@ -448,13 +448,13 @@ defmodule PolyxWeb.HomeLive do
 
   @impl true
   def handle_info({:trades_updated, %{address: address, trades: trades}}, socket) do
-    # Check if trades actually changed for this user
+    # Check if trades actually changed for this user using content fingerprint
     current_user = Enum.find(socket.assigns.tracked_users, &(&1.address == address))
-    current_trade_ids = if current_user, do: Enum.map(current_user.trades, & &1["id"]), else: []
-    new_trade_ids = Enum.map(trades, & &1["id"])
+    current_fingerprint = if current_user, do: trades_fingerprint(current_user.trades), else: nil
+    new_fingerprint = trades_fingerprint(trades)
 
-    if current_trade_ids == new_trade_ids do
-      # No change in trades, skip update
+    if current_fingerprint == new_fingerprint do
+      # No change in trades content, skip update
       {:noreply, socket}
     else
       # Update tracked user's trades
@@ -512,13 +512,13 @@ defmodule PolyxWeb.HomeLive do
               </div>
 
               <div class="flex items-center gap-3">
-                <%!-- Strategies Link --%>
+                <%!-- Strategies Link
                 <.link
                   navigate={~p"/strategies"}
                   class="px-4 py-2.5 rounded-xl bg-secondary/10 hover:bg-secondary/20 transition-colors text-sm font-medium flex items-center gap-2 text-secondary"
                 >
                   <.icon name="hero-cpu-chip" class="size-4" /> Strategies
-                </.link>
+                </.link> --%>
 
                 <%!-- Theme Toggle --%>
                 <button
@@ -1763,7 +1763,11 @@ defmodule PolyxWeb.HomeLive do
         }
       end)
     end)
-    # Sort by timestamp (most recent first) and limit to last 25
+    # Sort by size descending first for deterministic dedup (always keep largest)
+    |> Enum.sort_by(& &1.size, :desc)
+    # Deduplicate by trade_id
+    |> Enum.uniq_by(& &1.trade_id)
+    # Re-sort by timestamp (most recent first) for display
     |> Enum.sort_by(& &1.timestamp, :desc)
     |> Enum.take(@max_live_feed_items)
   end
@@ -1796,6 +1800,17 @@ defmodule PolyxWeb.HomeLive do
   # Filter live feed by address
   defp filter_feed(feed, nil), do: feed
   defp filter_feed(feed, address), do: Enum.filter(feed, &(&1.address == address))
+
+  # Create a fingerprint of trades for change detection
+  # Uses id + size + usdcSize to detect content changes
+  defp trades_fingerprint(trades) when is_list(trades) do
+    trades
+    |> Enum.map(fn t -> {t["id"], t["size"], t["usdcSize"]} end)
+    |> Enum.sort()
+    |> :erlang.phash2()
+  end
+
+  defp trades_fingerprint(_), do: nil
 
   # Get label for filtered user
   defp get_filter_label(tracked_users, address) do

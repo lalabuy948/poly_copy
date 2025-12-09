@@ -102,7 +102,12 @@ defmodule Polyx.Credentials do
   defp ensure_cache_table do
     case :ets.whereis(@cache_table) do
       :undefined ->
-        :ets.new(@cache_table, [:named_table, :public, :set])
+        # Handle race condition - another process may have created it between check and create
+        try do
+          :ets.new(@cache_table, [:named_table, :public, :set])
+        rescue
+          ArgumentError -> :ok
+        end
 
       _ ->
         :ok

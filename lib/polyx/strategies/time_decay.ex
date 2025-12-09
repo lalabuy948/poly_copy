@@ -15,9 +15,8 @@ defmodule Polyx.Strategies.TimeDecay do
   - cooldown_seconds: Cooldown between orders per market (default: 300)
   - min_spread: Maximum spread to tolerate (default: 0.02)
   - use_midpoint: Use midpoint price instead of best_bid (default: true)
-  - max_hours_to_resolution: Only trade markets expiring within N hours (default: 24)
-  - max_minutes_to_resolution: For short-term markets, minutes-based filter (default: nil)
-  - min_minutes_to_resolution: Minimum minutes before resolution (default: 1)
+  - max_minutes_to_resolution: For discovery, find markets expiring within N minutes (default: 15)
+  - min_minutes: Only trade when this many minutes or LESS remain (default: 2)
   - min_profit: Minimum estimated profit in USD to signal (default: 0.01)
   - auto_discover_crypto: Automatically discover 15-min crypto markets (default: false)
   """
@@ -34,8 +33,23 @@ defmodule Polyx.Strategies.TimeDecay do
 
   @impl true
   def init(config) do
+    # Merge user config with hardcoded defaults
+    full_config =
+      Map.merge(
+        %{
+          "auto_discover_crypto" => true,
+          "crypto_only" => true,
+          "max_minutes_to_resolution" => 15,
+          "cooldown_seconds" => 60,
+          "min_profit" => 0.01,
+          "discovery_interval_seconds" => 30,
+          "scan_enabled" => false
+        },
+        config
+      )
+
     state = %{
-      config: config,
+      config: full_config,
       # Track prices per token
       prices: %{},
       # Cooldown per token to avoid rapid re-entry
@@ -62,8 +76,7 @@ defmodule Polyx.Strategies.TimeDecay do
 
     # If auto_discover_crypto is enabled, mark for initial discovery (done async by Runner)
     state =
-      if config["auto_discover_crypto"] == true do
-        Logger.info("[TimeDecay] Auto-discovery mode enabled")
+      if full_config["auto_discover_crypto"] == true do
         %{state | needs_initial_discovery: true}
       else
         state
@@ -74,25 +87,20 @@ defmodule Polyx.Strategies.TimeDecay do
 
   @impl true
   def validate_config(config) do
+    # Simplified validation for new config format
+    signal_threshold = config["signal_threshold"]
+    order_size = config["order_size"]
+    limit_price = config["limit_price"]
+
     cond do
-      !is_number(config["target_high_price"]) or config["target_high_price"] < 0.9 or
-          config["target_high_price"] > 1.0 ->
-        {:error, "target_high_price must be between 0.9 and 1.0"}
+      signal_threshold != nil and (signal_threshold < 0.5 or signal_threshold > 0.99) ->
+        {:error, "signal_threshold must be between 0.5 and 0.99"}
 
-      !is_number(config["target_low_price"]) or config["target_low_price"] < 0.0 or
-          config["target_low_price"] > 0.1 ->
-        {:error, "target_low_price must be between 0.0 and 0.1"}
-
-      !is_number(config["high_threshold"]) or config["high_threshold"] < 0.5 or
-          config["high_threshold"] > 1.0 ->
-        {:error, "high_threshold must be between 0.5 and 1.0"}
-
-      !is_number(config["low_threshold"]) or config["low_threshold"] < 0.0 or
-          config["low_threshold"] > 0.5 ->
-        {:error, "low_threshold must be between 0.0 and 0.5"}
-
-      !is_number(config["order_size"]) or config["order_size"] <= 0 ->
+      order_size != nil and order_size <= 0 ->
         {:error, "order_size must be a positive number"}
+
+      limit_price != nil and (limit_price < 0.9 or limit_price > 1.0) ->
+        {:error, "limit_price must be between 0.9 and 1.0"}
 
       true ->
         :ok
@@ -196,15 +204,12 @@ defmodule Polyx.Strategies.TimeDecay do
       {:ok, %{new_state | removed_tokens: removed}, signals}
   end
 
-  # Discover 15-minute crypto markets and evaluate them for opportunities
-  defp discover_crypto_markets(state) do
+  # Discover crypto markets within the configured time window (default: 15 min)
+  # Public so Runner can call it
+  def discover_crypto_markets(state) do
     config = state.config
-    max_minutes = config["max_minutes_to_resolution"] || 120
+    max_minutes = config["max_minutes_to_resolution"] || 15
     min_minutes = config["min_minutes_to_resolution"] || 1
-
-    Logger.debug(
-      "[TimeDecay] Discovering crypto markets ending in #{min_minutes}-#{max_minutes} minutes"
-    )
 
     case Gamma.fetch_crypto_markets_ending_soon(
            max_minutes: max_minutes,
@@ -237,8 +242,8 @@ defmodule Polyx.Strategies.TimeDecay do
         # Update discovered tokens
         state = %{state | discovered_tokens: MapSet.union(state.discovered_tokens, new_tokens)}
 
-        # Evaluate each new token for opportunities
-        {signals, state} =
+        # Build list of tokens to cache (not yet evaluated)
+        tokens_to_cache =
           events
           |> Enum.flat_map(fn event ->
             (event[:markets] || [])
@@ -249,14 +254,12 @@ defmodule Polyx.Strategies.TimeDecay do
             end)
           end)
           |> Enum.filter(fn {token_id, _event, _market} ->
-            # Only evaluate tokens we haven't already evaluated recently
             not MapSet.member?(state.evaluated_tokens, token_id)
           end)
-          |> Enum.reduce({[], state}, fn {token_id, event, market}, {sigs, st} ->
-            # Mark token as evaluated
-            st = %{st | evaluated_tokens: MapSet.put(st.evaluated_tokens, token_id)}
 
-            # Cache market info for faster lookups
+        # Cache market info (fast, no API calls) - prices come from WebSocket
+        state =
+          Enum.reduce(tokens_to_cache, state, fn {token_id, event, market}, st ->
             market_info = %{
               question: market[:question],
               event_title: event[:title],
@@ -265,26 +268,16 @@ defmodule Polyx.Strategies.TimeDecay do
               expires_at: System.system_time(:second) + 300
             }
 
-            st = %{st | market_cache: Map.put(st.market_cache, token_id, market_info)}
-
-            case check_token_opportunity(st, token_id) do
-              {:opportunity, signal, new_st} ->
-                Logger.info(
-                  "[TimeDecay] Found opportunity in #{token_id}: #{signal.action} @ #{signal.price}"
-                )
-
-                {[signal | sigs], new_st}
-
-              :no_opportunity ->
-                {sigs, st}
-            end
+            %{
+              st
+              | evaluated_tokens: MapSet.put(st.evaluated_tokens, token_id),
+                market_cache: Map.put(st.market_cache, token_id, market_info)
+            }
           end)
 
-        if signals == [] do
-          {:ok, state}
-        else
-          {:ok, state, Enum.reverse(signals)}
-        end
+        # Don't fetch orderbooks during discovery - WebSocket will provide real-time prices
+        # Signals will be generated when price updates arrive via handle_order
+        {:ok, state}
     end
   end
 
@@ -303,8 +296,6 @@ defmodule Polyx.Strategies.TimeDecay do
     scan_limit = config["scan_limit"] || 20
     max_hours = config["max_hours_to_resolution"] || 24
 
-    Logger.debug("[TimeDecay] Scanning for near-expiry markets (limit: #{scan_limit})")
-
     case Gamma.fetch_events(limit: scan_limit, offset: state.scan_offset) do
       {:ok, events} ->
         # Filter to near-expiry events
@@ -322,8 +313,6 @@ defmodule Polyx.Strategies.TimeDecay do
                 false
             end
           end)
-
-        Logger.debug("[TimeDecay] Found #{length(near_expiry_events)} near-expiry events")
 
         # Check each market for opportunities
         {signals, state} =
@@ -456,82 +445,45 @@ defmodule Polyx.Strategies.TimeDecay do
 
   defp check_time_decay_opportunity(state, asset_id, best_bid, best_ask, order) do
     config = state.config
-    high_threshold = config["high_threshold"] || 0.90
-    _low_threshold = config["low_threshold"]  # unused - we only buy at high prices
-    target_high_price = config["target_high_price"] || 0.99
-    _target_low_price = config["target_low_price"] || 0.01
-    order_size = config["order_size"] || 10
-    cooldown_seconds = config["cooldown_seconds"] || 300
-    min_spread = config["min_spread"] || 0.02
-    use_midpoint = config["use_midpoint"] != false
-    max_hours = config["max_hours_to_resolution"] || 24
-    # New: minutes-based filtering for short-term markets
-    max_minutes = config["max_minutes_to_resolution"]
-    min_minutes = config["min_minutes_to_resolution"] || 1
+
+    # User-configurable settings (new simplified config)
+    signal_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
+    order_size = config["order_size"] || 5.0
+    min_minutes = config["min_minutes"] || config["min_minutes_to_resolution"] || 1.0
+    use_limit_order = config["use_limit_order"] != false
+    limit_price = config["limit_price"] || config["target_high_price"] || 0.99
+
+    # Hardcoded settings
+    cooldown_seconds = config["cooldown_seconds"] || 60
     min_profit = config["min_profit"] || 0.01
-    crypto_only = config["crypto_only"] == true
+    crypto_only = config["crypto_only"] != false
 
     # Check cooldown first (fast path)
     if in_cooldown?(state, asset_id) do
-      Logger.debug("[TimeDecay] Skipping #{asset_id} - in cooldown")
       :no_opportunity
     else
-      # Calculate price to use
-      current_price = calculate_evaluation_price(best_bid, best_ask, use_midpoint)
-      spread = calculate_spread(best_bid, best_ask)
+      # Calculate price to use (always use midpoint)
+      current_price = calculate_evaluation_price(best_bid, best_ask, true)
+      _spread = calculate_spread(best_bid, best_ask)
 
       # Get market info for this token (to determine YES/NO and resolution status)
-      {outcome, market_info, state} = get_token_info(state, asset_id)
+      {_outcome, market_info, state} = get_token_info(state, asset_id)
 
       # Check if crypto_only filter should skip non-crypto markets
       is_crypto = is_crypto_market?(market_info)
 
-      # Check time to resolution (supports both minutes and hours)
+      # Check time to resolution (minutes-based for crypto markets)
       minutes_to_resolution = calculate_minutes_to_resolution(market_info[:end_date])
-      hours_to_resolution = if minutes_to_resolution, do: minutes_to_resolution / 60, else: nil
 
-      # Determine time constraints based on config
-      {time_ok, _time_reason} =
+      # Time constraints: must be <= min_minutes (only trade very close to expiry)
+      # min_minutes means "only trade when this many minutes or less remain"
+      time_ok =
         cond do
-          # Minutes-based filtering (for 15-min markets)
-          max_minutes != nil ->
-            cond do
-              is_nil(minutes_to_resolution) ->
-                {false, "unknown time to resolution"}
-
-              minutes_to_resolution > max_minutes ->
-                {false, "#{Float.round(minutes_to_resolution, 1)} min > #{max_minutes} min max"}
-
-              minutes_to_resolution < min_minutes ->
-                {false, "#{Float.round(minutes_to_resolution, 1)} min < #{min_minutes} min min"}
-
-              true ->
-                {true, nil}
-            end
-
-          # Hours-based filtering (original behavior)
-          true ->
-            cond do
-              is_nil(hours_to_resolution) ->
-                {false, "unknown time to resolution"}
-
-              hours_to_resolution > max_hours ->
-                {false, "#{Float.round(hours_to_resolution, 1)}h > #{max_hours}h max"}
-
-              hours_to_resolution < 1 ->
-                {false, "#{Float.round(hours_to_resolution, 1)}h too close to resolution"}
-
-              true ->
-                {true, nil}
-            end
+          is_nil(minutes_to_resolution) -> false
+          minutes_to_resolution <= 0 -> false
+          minutes_to_resolution > min_minutes -> false
+          true -> true
         end
-
-      # Log price check for debugging (only for significant prices)
-      if current_price && (current_price > 0.70 || current_price < 0.30) do
-        Logger.debug(
-          "[TimeDecay] Price check: #{Float.round(current_price * 100, 1)}¢ | outcome=#{outcome} | time_ok=#{time_ok} | spread=#{spread && Float.round(spread, 4)} | crypto=#{is_crypto}"
-        )
-      end
 
       cond do
         # Price is nil - can't evaluate
@@ -546,22 +498,20 @@ defmodule Polyx.Strategies.TimeDecay do
         not time_ok ->
           :no_opportunity
 
-        # Spread too wide - market is illiquid, skip
-        spread && spread > min_spread * 2 ->
+        # Price not high enough
+        current_price <= signal_threshold ->
           :no_opportunity
 
-        # Price not high enough - wait for 90%+
-        current_price <= high_threshold ->
-          :no_opportunity
+        # HIGH PRICE: Token likely resolving to 1.0 - BUY!
+        current_price > signal_threshold ->
+          # Determine buy price: limit order uses limit_price, market order uses best_ask
+          buy_price = if use_limit_order, do: limit_price, else: best_ask
 
-        # HIGH PRICE (90%+): Token likely resolving to 1.0
-        # BUY to capture final move to $1.00
-        current_price > high_threshold ->
           generate_buy_signal(
             state,
             asset_id,
             current_price,
-            target_high_price,
+            buy_price,
             order_size,
             cooldown_seconds,
             min_profit,
@@ -730,9 +680,7 @@ defmodule Polyx.Strategies.TimeDecay do
             cooldowns
           end
 
-        Logger.debug(
-          "[TimeDecay] Set cooldown for market (both tokens) until #{cooldown_until}"
-        )
+        Logger.debug("[TimeDecay] Set cooldown for market (both tokens) until #{cooldown_until}")
 
         placed_orders = Map.put(state.placed_orders, asset_id, signal)
 

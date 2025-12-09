@@ -69,6 +69,12 @@ defmodule Polyx.Strategies do
     |> Repo.update()
   end
 
+  def delete_trades(strategy_id) do
+    Trade
+    |> where([t], t.type == "strategy" and t.strategy_id == ^strategy_id)
+    |> Repo.delete_all()
+  end
+
   # Position operations
 
   def list_positions(strategy_id) do
