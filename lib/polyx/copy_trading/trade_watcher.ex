@@ -15,14 +15,14 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   import Ecto.Query
 
-  # Polymarket Data API rate limit: 200 requests / 10 seconds
-  # We use 50% of capacity to leave headroom for other operations
-  # With 100 req/10s budget and 3s interval, we can track up to 33 users comfortably
-  @base_poll_interval :timer.seconds(3)
-  @max_requests_per_10s 100
+  # Polymarket Data API rate limit: 60 requests/minute (10 per 10 seconds)
+  # Use 90% capacity for aggressive copy trading
+  @base_poll_interval :timer.seconds(2)
+  @max_requests_per_10s 54
 
   defstruct tracked_users: %{},
             last_trade_ids: %{},
+            in_flight: %{},
             poll_ref: nil
 
   # Client API
@@ -313,14 +313,40 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   @impl true
   def handle_info({:fetch_trades, address}, state) do
-    case fetch_user_trades(address) do
-      {:ok, trades} ->
-        {:noreply, process_trades(state, address, trades)}
+    # Skip if there's already an in-flight request for this address
+    if Map.has_key?(state.in_flight, address) do
+      {:noreply, state}
+    else
+      # Mark as in-flight and spawn task
+      parent = self()
 
-      {:error, reason} ->
-        Logger.warning("Failed to fetch trades for #{address}: #{inspect(reason)}")
-        {:noreply, state}
+      Task.start(fn ->
+        result = fetch_user_trades(address)
+        send(parent, {:trades_fetched, address, result})
+      end)
+
+      {:noreply, %{state | in_flight: Map.put(state.in_flight, address, true)}}
     end
+  end
+
+  @impl true
+  def handle_info({:trades_fetched, address, {:ok, trades}}, state) do
+    # Clear in-flight flag and process trades
+    state = %{state | in_flight: Map.delete(state.in_flight, address)}
+    {:noreply, process_trades(state, address, trades)}
+  end
+
+  @impl true
+  def handle_info({:trades_fetched, address, {:error, :rate_limited}}, state) do
+    # Rate limited - clear in-flight flag, will retry on next poll
+    {:noreply, %{state | in_flight: Map.delete(state.in_flight, address)}}
+  end
+
+  @impl true
+  def handle_info({:trades_fetched, address, {:error, reason}}, state) do
+    Logger.warning("Failed to fetch trades for #{address}: #{inspect(reason)}")
+    # Clear in-flight flag so next poll can retry
+    {:noreply, %{state | in_flight: Map.delete(state.in_flight, address)}}
   end
 
   # Private functions
@@ -378,9 +404,12 @@ defmodule Polyx.CopyTrading.TradeWatcher do
 
   defp fetch_user_trades(address) do
     # Fetch activity from Data API (shows actual trades with timestamps)
-    case Client.get_activity(address) do
+    # Only fetch recent activity (100 items) for live feed - no need for full history
+    case Client.get_activity(address, max_activities: 100) do
       {:ok, activities} when is_list(activities) ->
         # Transform activities into trade format - only include TRADE type
+        # Logger.info("Fetched #{length(activities)} activities for #{address}")
+
         trades =
           activities
           |> Enum.filter(fn act -> act["type"] == "TRADE" end)
@@ -402,53 +431,67 @@ defmodule Polyx.CopyTrading.TradeWatcher do
               "transactionHash" => act["transactionHash"]
             }
           end)
-          |> Enum.take(100)
+          # Sort by size descending THEN deduplicate - ensures we always keep largest
+          # entry for each tx hash regardless of API response order
+          |> Enum.sort_by(fn t -> -(t["size"] || 0) end)
+          |> Enum.uniq_by(& &1["id"])
+          # Re-sort by timestamp descending for chronological display
+          |> Enum.sort_by(fn t -> -(t["timestamp"] || 0) end)
+
+        # |> Enum.take(100)
 
         {:ok, trades}
 
-      {:ok, _} ->
-        {:ok, []}
+      {:error, :rate_limited} ->
+        # Expected when polling frequently - will retry on next poll
+        {:error, :rate_limited}
 
       {:error, reason} ->
+        Logger.warning("Failed to fetch trades for #{address}: #{inspect(reason)}")
         {:error, reason}
     end
   end
 
   defp process_trades(state, address, trades) do
-    known_ids = Map.get(state.last_trade_ids, address, MapSet.new())
+    # Check if user is still tracked (might have been untracked during async fetch)
+    case Map.get(state.tracked_users, address) do
+      nil ->
+        # User was untracked while trades were being fetched, ignore
+        state
 
-    new_trades =
-      trades
-      |> Enum.reject(fn trade -> MapSet.member?(known_ids, trade["id"]) end)
+      user_info ->
+        known_ids = Map.get(state.last_trade_ids, address, MapSet.new())
 
-    if new_trades != [] do
-      Logger.info("Found #{length(new_trades)} new trades for #{short_address(address)}")
+        new_trades =
+          trades
+          |> Enum.reject(fn trade -> MapSet.member?(known_ids, trade["id"]) end)
 
-      # Broadcast new trades for copy execution
-      Enum.each(new_trades, fn trade ->
-        CopyTrading.broadcast(:new_trade, %{address: address, trade: trade})
-      end)
+        if new_trades != [] do
+          Logger.info("Found #{length(new_trades)} new trades for #{short_address(address)}")
+
+          # Broadcast new trades for copy execution
+          Enum.each(new_trades, fn trade ->
+            CopyTrading.broadcast(:new_trade, %{address: address, trade: trade})
+          end)
+        end
+
+        # Update state
+        all_trade_ids =
+          trades
+          |> Enum.map(& &1["id"])
+          |> MapSet.new()
+
+        updated_user = Map.put(user_info, :trades, trades)
+
+        # Broadcast trades updated so LiveView can sync
+        CopyTrading.broadcast(:trades_updated, %{address: address, trades: trades})
+
+        %{
+          state
+          | tracked_users: Map.put(state.tracked_users, address, updated_user),
+            last_trade_ids: Map.put(state.last_trade_ids, address, all_trade_ids)
+        }
     end
-
-    # Update state
-    all_trade_ids =
-      trades
-      |> Enum.map(& &1["id"])
-      |> MapSet.new()
-
-    updated_user =
-      state.tracked_users
-      |> Map.get(address)
-      |> Map.put(:trades, trades)
-
-    # Broadcast trades updated so LiveView can sync
-    CopyTrading.broadcast(:trades_updated, %{address: address, trades: trades})
-
-    %{
-      state
-      | tracked_users: Map.put(state.tracked_users, address, updated_user),
-        last_trade_ids: Map.put(state.last_trade_ids, address, all_trade_ids)
-    }
   end
 
   defp normalize_address(address) do

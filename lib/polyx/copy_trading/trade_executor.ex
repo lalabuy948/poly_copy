@@ -10,7 +10,8 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   alias Polyx.Polymarket.Client
   alias Polyx.CopyTrading
-  alias Polyx.CopyTrading.{CopyTrade, Settings}
+  alias Polyx.CopyTrading.Settings
+  alias Polyx.Trades.Trade
   alias Polyx.Repo
 
   defstruct settings: %{
@@ -38,9 +39,9 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   def get_copy_trades do
     # Load from database instead of GenServer state
-    CopyTrade.recent(100)
+    Trade.recent_copy_trades(100)
     |> Repo.all()
-    |> Enum.map(&CopyTrade.to_stream_format/1)
+    |> Enum.map(&Trade.to_copy_stream_format/1)
   end
 
   def execute_copy_trade(original_trade, opts \\ []) do
@@ -93,11 +94,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
   @impl true
   def handle_call({:retry_copy_trade, trade_id}, _from, state) do
-    case Repo.get(CopyTrade, trade_id) do
+    case Repo.get(Trade, trade_id) do
       nil ->
         {:reply, {:error, :not_found}, state}
 
-      %CopyTrade{status: "failed"} = db_trade ->
+      %Trade{type: "copy", status: "failed"} = db_trade ->
         # Retry the trade - apply tick size rounding to price
         price = db_trade.original_price |> decimal_to_float() |> round_to_tick_size()
 
@@ -105,46 +106,49 @@ defmodule Polyx.CopyTrading.TradeExecutor do
           case Client.place_order(%{
                  token_id: db_trade.asset_id,
                  side: db_trade.side,
-                 size: Decimal.to_float(db_trade.copy_size),
+                 size: Decimal.to_float(db_trade.size),
                  price: price
                }) do
             {:ok, _result} ->
               {"executed", DateTime.utc_now(), nil}
 
             {:error, reason} ->
-              {"failed", DateTime.utc_now(), inspect(reason)}
+              {"failed", DateTime.utc_now(), format_error(reason)}
           end
 
         # Update the database record
         {:ok, updated_trade} =
           db_trade
-          |> CopyTrade.changeset(%{
+          |> Trade.copy_changeset(%{
             status: new_status,
             executed_at: executed_at,
             error_message: error_msg
           })
           |> Repo.update()
 
-        stream_trade = CopyTrade.to_stream_format(updated_trade)
+        stream_trade = Trade.to_copy_stream_format(updated_trade)
         CopyTrading.broadcast(:copy_trade_updated, stream_trade)
 
         {:reply, {:ok, stream_trade}, state}
 
-      %CopyTrade{} ->
+      %Trade{type: "copy"} ->
         {:reply, {:error, :not_failed}, state}
+
+      _ ->
+        {:reply, {:error, :not_found}, state}
     end
   end
 
   @impl true
   def handle_call({:delete_copy_trade, trade_id}, _from, state) do
-    case Repo.get(CopyTrade, trade_id) do
+    case Repo.get(Trade, trade_id) do
       nil ->
         {:reply, {:error, :not_found}, state}
 
-      %CopyTrade{status: "failed"} = db_trade ->
+      %Trade{type: "copy", status: "failed"} = db_trade ->
         case Repo.delete(db_trade) do
           {:ok, deleted_trade} ->
-            stream_trade = CopyTrade.to_stream_format(deleted_trade)
+            stream_trade = Trade.to_copy_stream_format(deleted_trade)
             CopyTrading.broadcast(:copy_trade_deleted, stream_trade)
             {:reply, {:ok, stream_trade}, state}
 
@@ -152,18 +156,18 @@ defmodule Polyx.CopyTrading.TradeExecutor do
             {:reply, {:error, reason}, state}
         end
 
-      %CopyTrade{} ->
+      %Trade{type: "copy"} ->
         {:reply, {:error, :not_failed}, state}
+
+      _ ->
+        {:reply, {:error, :not_found}, state}
     end
   end
 
   @impl true
   def handle_call(:delete_all_failed_copy_trades, _from, state) do
-    import Ecto.Query
-
     failed_trades =
-      CopyTrade
-      |> where([t], t.status == "failed")
+      Trade.copy_trades_by_status("failed")
       |> Repo.all()
 
     if failed_trades == [] do
@@ -173,7 +177,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
       Enum.each(failed_trades, fn db_trade ->
         case Repo.delete(db_trade) do
           {:ok, deleted_trade} ->
-            stream_trade = CopyTrade.to_stream_format(deleted_trade)
+            stream_trade = Trade.to_copy_stream_format(deleted_trade)
             CopyTrading.broadcast(:copy_trade_deleted, stream_trade)
 
           {:error, _reason} ->
@@ -199,7 +203,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     if state.settings.enabled do
       {:noreply, do_execute_copy_trade(state, source_address, trade)}
     else
-      Logger.debug("Copy trading disabled, ignoring trade from #{source_address}")
+      # Logger.debug("Copy trading disabled, ignoring trade from #{source_address}")
       {:noreply, state}
     end
   end
@@ -250,7 +254,7 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     original_trade_id = original_trade["id"]
 
     # Check if we already copied this trade (prevent duplicates)
-    if Repo.exists?(CopyTrade.exists?(original_trade_id)) do
+    if Repo.exists?(Trade.copy_trade_exists?(original_trade_id)) do
       Logger.info("Trade #{original_trade_id} already copied, skipping duplicate")
       state
     else
@@ -275,19 +279,20 @@ defmodule Polyx.CopyTrading.TradeExecutor do
 
           {:error, reason} ->
             Logger.error("Failed to execute copy trade: #{inspect(reason)}")
-            {"failed", DateTime.utc_now(), inspect(reason)}
+            {"failed", DateTime.utc_now(), format_error(reason)}
         end
 
       # Save to database
       attrs = %{
         source_address: source_address,
         original_trade_id: original_trade_id,
-        market: original_trade["market"],
+        market_id: original_trade["market"],
         asset_id: original_trade["asset_id"],
         side: original_trade["side"],
         original_size: parse_size(original_trade["size"]),
         original_price: parse_price(original_trade["price"]),
-        copy_size: size,
+        size: size,
+        price: price,
         status: status,
         executed_at: executed_at,
         error_message: error_msg,
@@ -296,9 +301,9 @@ defmodule Polyx.CopyTrading.TradeExecutor do
         event_slug: original_trade["event_slug"]
       }
 
-      case %CopyTrade{} |> CopyTrade.changeset(attrs) |> Repo.insert() do
+      case %Trade{} |> Trade.copy_changeset(attrs) |> Repo.insert() do
         {:ok, db_trade} ->
-          stream_trade = CopyTrade.to_stream_format(db_trade)
+          stream_trade = Trade.to_copy_stream_format(db_trade)
           CopyTrading.broadcast(:copy_trade_executed, stream_trade)
           state
 
@@ -309,9 +314,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     end
   end
 
-  # Polymarket minimum order size is 5 SHARES (not dollars)
-  # At typical prices, this is roughly $0.50 to $5 depending on price
+  # Polymarket has TWO minimum requirements:
+  # 1. Minimum 5 shares per order
+  # 2. Minimum $1 dollar value for marketable orders
   @min_order_shares 5.0
+  @min_order_dollars 1.0
 
   defp calculate_size(settings, original_trade, price) do
     original_size = parse_size(original_trade["size"])
@@ -338,7 +345,11 @@ defmodule Polyx.CopyTrading.TradeExecutor do
     shares = if price > 0, do: dollar_amount / price, else: dollar_amount
 
     # Enforce minimum of 5 shares (Polymarket API requirement)
-    max(shares, @min_order_shares)
+    shares = max(shares, @min_order_shares)
+
+    # Also enforce minimum $1 dollar value for marketable orders
+    min_shares_for_dollar = if price > 0, do: @min_order_dollars / price, else: @min_order_shares
+    max(shares, min_shares_for_dollar)
   end
 
   defp parse_size(size) when is_binary(size), do: String.to_float(size)
@@ -367,4 +378,14 @@ defmodule Polyx.CopyTrading.TradeExecutor do
   defp decimal_to_float(nil), do: nil
   defp decimal_to_float(%Decimal{} = d), do: Decimal.to_float(d)
   defp decimal_to_float(n) when is_number(n), do: n
+
+  # Format errors - prefer string messages, fall back to inspect
+  defp format_error(message) when is_binary(message), do: message
+  defp format_error(%Polyx.Polymarket.Client.APIError{message: message}), do: message
+  defp format_error(%{message: message}) when is_binary(message), do: message
+  defp format_error(%{"message" => message}) when is_binary(message), do: message
+  defp format_error(%{error: message}) when is_binary(message), do: message
+  defp format_error(%{"error" => message}) when is_binary(message), do: message
+  defp format_error({_status, %{"error" => message}}) when is_binary(message), do: message
+  defp format_error(reason), do: inspect(reason)
 end

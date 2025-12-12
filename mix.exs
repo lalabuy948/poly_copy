@@ -87,7 +87,9 @@ defmodule Polyx.MixProject do
       # Crypto libs for EIP-712 signing
       {:ex_keccak, "~> 0.7"},
       {:ex_secp256k1, "~> 0.7"},
-      {:burrito, "~> 1.1"}
+      {:burrito, "~> 1.1"},
+      # WebSocket client
+      {:fresh, "~> 0.4"}
     ]
   end
 

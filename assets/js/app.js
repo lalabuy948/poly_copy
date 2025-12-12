@@ -24,18 +24,44 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/polyx"
 import topbar from "../vendor/topbar"
+import "../vendor/chart"
+import {TradeDotsChart, CumulativeSharesChart, CumulativeDollarsChart, ExposureChart, PnLChart, MarketTagsChart} from "./profile_charts"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks},
+  hooks: {...colocatedHooks, TradeDotsChart, CumulativeSharesChart, CumulativeDollarsChart, ExposureChart, PnLChart, MarketTagsChart},
 })
 
 // Show progress bar on live navigation and form submits
 topbar.config({barColors: {0: "#29d"}, shadowColor: "rgba(0, 0, 0, .3)"})
 window.addEventListener("phx:page-loading-start", _info => topbar.show(300))
 window.addEventListener("phx:page-loading-stop", _info => topbar.hide())
+
+// Copy to clipboard handler
+window.addEventListener("phx:copy", (event) => {
+  const text = event.detail.text
+  if (text) {
+    navigator.clipboard.writeText(text).then(() => {
+      // Dispatch event to show flash via LiveView
+      liveSocket.execJS(document.body, JSON.stringify([
+        ["push", {event: "lv:clear-flash"}],
+        ["push", {event: "lv:clear-flash", value: {key: "info"}}]
+      ]))
+      // Show a temporary toast
+      const toast = document.createElement("div")
+      toast.className = "fixed bottom-4 right-4 px-4 py-2 rounded-lg bg-success text-success-content text-sm font-medium shadow-lg z-50 animate-fade-in"
+      toast.textContent = "Copied to clipboard"
+      document.body.appendChild(toast)
+      setTimeout(() => {
+        toast.style.opacity = "0"
+        toast.style.transition = "opacity 0.3s"
+        setTimeout(() => toast.remove(), 300)
+      }, 2000)
+    })
+  }
+})
 
 // connect if there are any LiveViews on the page
 liveSocket.connect()

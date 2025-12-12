@@ -18,6 +18,8 @@ defmodule PolyxWeb.Router do
     pipe_through :browser
 
     live "/", HomeLive
+    live "/strategies", StrategiesLive
+    live "/profile/:address", ProfileLive
   end
 
   # Other scopes may use custom stacks.

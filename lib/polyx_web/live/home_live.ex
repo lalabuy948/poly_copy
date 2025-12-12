@@ -350,63 +350,27 @@ defmodule PolyxWeb.HomeLive do
   end
 
   @impl true
-  def handle_info({:new_trade, %{address: address, trade: trade}}, socket) do
-    # Find the user label for this address
-    user = Enum.find(socket.assigns.tracked_users, fn u -> u.address == address end)
-    label = if user, do: user.label, else: short_address(address)
-
-    # Create feed item for the live feed stream
-    feed_item = %{
-      id: trade["id"] || System.unique_integer([:positive]),
-      trade_id: trade["id"],
-      address: address,
-      label: label,
-      side: trade["side"] || "UNKNOWN",
-      size: parse_trade_value(trade["size"]),
-      price: parse_trade_value(trade["price"]),
-      avg_price: parse_trade_value(trade["avgPrice"]),
-      outcome: trade["outcome"],
-      title: trade["title"],
-      market_slug: trade["market_slug"],
-      event_slug: trade["event_slug"],
-      asset_id: trade["asset_id"],
-      pnl: parse_trade_value(trade["pnl"]),
-      percent_pnl: parse_trade_value(trade["percentPnl"]),
-      current_value: parse_trade_value(trade["currentValue"]),
-      end_date: trade["endDate"],
-      icon: trade["icon"],
-      redeemable: trade["redeemable"],
-      timestamp: parse_timestamp(trade["timestamp"]),
-      usdc_size: parse_trade_value(trade["usdcSize"])
-    }
-
-    # Update tracked users with new trades
-    updated_users =
-      Enum.map(socket.assigns.tracked_users, fn user ->
-        if user.address == address do
-          case CopyTrading.get_user_trades(address) do
-            {:ok, trades} -> %{user | trades: trades}
-            _ -> user
-          end
-        else
-          user
-        end
-      end)
-
-    {:noreply,
-     socket
-     |> assign(:tracked_users, updated_users)
-     |> stream_insert(:live_feed, feed_item, at: 0)}
+  def handle_info({:new_trade, %{address: _address, trade: _trade}}, socket) do
+    # Don't insert here - let :trades_updated handle the feed with proper sorting
+    # This event is still useful for copy trading execution
+    {:noreply, socket}
   end
 
   @impl true
   def handle_info({:copy_trade_executed, trade}, socket) do
     copied_ids = MapSet.put(socket.assigns.copied_trade_ids, trade.original_trade_id)
 
+    # Rebuild live feed to show "Copied" label on the trade
+    live_feed =
+      socket.assigns.tracked_users
+      |> collect_live_feed()
+      |> filter_feed(socket.assigns.feed_filter)
+
     socket =
       socket
       |> assign(:copied_trade_ids, copied_ids)
       |> stream_insert(:copy_trades, trade, at: 0)
+      |> stream(:live_feed, live_feed, reset: true)
 
     # Show flash based on trade status
     socket =
@@ -438,10 +402,17 @@ defmodule PolyxWeb.HomeLive do
     # Remove from copied_trade_ids so the trade shows "Copy" button again in live feed
     copied_ids = MapSet.delete(socket.assigns.copied_trade_ids, trade.original_trade_id)
 
+    # Rebuild live feed to show "Copy" button again
+    live_feed =
+      socket.assigns.tracked_users
+      |> collect_live_feed()
+      |> filter_feed(socket.assigns.feed_filter)
+
     {:noreply,
      socket
      |> assign(:copied_trade_ids, copied_ids)
-     |> stream_delete(:copy_trades, trade)}
+     |> stream_delete(:copy_trades, trade)
+     |> stream(:live_feed, live_feed, reset: true)}
   end
 
   @impl true
@@ -477,26 +448,36 @@ defmodule PolyxWeb.HomeLive do
 
   @impl true
   def handle_info({:trades_updated, %{address: address, trades: trades}}, socket) do
-    # Update tracked user's trades
-    updated_users =
-      Enum.map(socket.assigns.tracked_users, fn user ->
-        if user.address == address do
-          %{user | trades: trades}
-        else
-          user
-        end
-      end)
+    # Check if trades actually changed for this user using content fingerprint
+    current_user = Enum.find(socket.assigns.tracked_users, &(&1.address == address))
+    current_fingerprint = if current_user, do: trades_fingerprint(current_user.trades), else: nil
+    new_fingerprint = trades_fingerprint(trades)
 
-    # Rebuild live feed with updated trades
-    live_feed =
-      updated_users
-      |> collect_live_feed()
-      |> filter_feed(socket.assigns.feed_filter)
+    if current_fingerprint == new_fingerprint do
+      # No change in trades content, skip update
+      {:noreply, socket}
+    else
+      # Update tracked user's trades
+      updated_users =
+        Enum.map(socket.assigns.tracked_users, fn user ->
+          if user.address == address do
+            %{user | trades: trades}
+          else
+            user
+          end
+        end)
 
-    {:noreply,
-     socket
-     |> assign(:tracked_users, updated_users)
-     |> stream(:live_feed, live_feed, reset: true)}
+      # Rebuild live feed with updated trades (ensures correct sort order across all users)
+      live_feed =
+        updated_users
+        |> collect_live_feed()
+        |> filter_feed(socket.assigns.feed_filter)
+
+      {:noreply,
+       socket
+       |> assign(:tracked_users, updated_users)
+       |> stream(:live_feed, live_feed, reset: true)}
+    end
   end
 
   defp parse_float(str) when is_binary(str) do
@@ -531,6 +512,14 @@ defmodule PolyxWeb.HomeLive do
               </div>
 
               <div class="flex items-center gap-3">
+                <%!-- Strategies Link
+                <.link
+                  navigate={~p"/strategies"}
+                  class="px-4 py-2.5 rounded-xl bg-secondary/10 hover:bg-secondary/20 transition-colors text-sm font-medium flex items-center gap-2 text-secondary"
+                >
+                  <.icon name="hero-cpu-chip" class="size-4" /> Strategies
+                </.link> --%>
+
                 <%!-- Theme Toggle --%>
                 <button
                   type="button"
@@ -737,17 +726,27 @@ defmodule PolyxWeb.HomeLive do
                           </div>
                           <div>
                             <div class="flex items-center gap-1">
+                              <.link
+                                navigate={~p"/profile/#{user.address}"}
+                                class="font-medium text-sm hover:text-primary transition-colors"
+                              >
+                                {user.label}
+                              </.link>
+                              <.link
+                                navigate={~p"/profile/#{user.address}"}
+                                title="View trade analysis"
+                                class="p-1 rounded text-base-content/30 hover:text-info hover:bg-info/10 opacity-0 group-hover:opacity-100 transition-all"
+                              >
+                                <.icon name="hero-chart-bar" class="size-3" />
+                              </.link>
                               <a
                                 href={"https://polymarket.com/profile/#{user.address}"}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                class="font-medium text-sm hover:text-primary transition-colors"
+                                title="View on Polymarket"
+                                class="p-1 rounded text-base-content/30 hover:text-primary hover:bg-primary/10 opacity-0 group-hover:opacity-100 transition-all"
                               >
-                                {user.label}
-                                <.icon
-                                  name="hero-arrow-top-right-on-square"
-                                  class="size-3 inline ml-0.5 opacity-50"
-                                />
+                                <.icon name="hero-arrow-top-right-on-square" class="size-3" />
                               </a>
                               <button
                                 type="button"
@@ -831,17 +830,23 @@ defmodule PolyxWeb.HomeLive do
                         </span>
                       </div>
                       <div>
-                        <a
-                          href={"https://polymarket.com/profile/#{user.address}"}
-                          target="_blank"
-                          class="font-medium text-sm text-base-content/60 hover:text-primary transition-colors"
-                        >
-                          {user.label}
-                          <.icon
-                            name="hero-arrow-top-right-on-square"
-                            class="size-3 inline ml-0.5 opacity-50"
-                          />
-                        </a>
+                        <div class="flex items-center gap-1">
+                          <.link
+                            navigate={~p"/profile/#{user.address}"}
+                            class="font-medium text-sm text-base-content/60 hover:text-primary transition-colors"
+                          >
+                            {user.label}
+                          </.link>
+                          <a
+                            href={"https://polymarket.com/profile/#{user.address}"}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="View on Polymarket"
+                            class="text-base-content/30 hover:text-primary transition-colors"
+                          >
+                            <.icon name="hero-arrow-top-right-on-square" class="size-3" />
+                          </a>
+                        </div>
                         <p class="text-xs text-base-content/30 font-mono">
                           {String.slice(user.address, 0, 10)}...{String.slice(user.address, -6, 6)}
                         </p>
@@ -1349,13 +1354,25 @@ defmodule PolyxWeb.HomeLive do
                       <%= if @credentials.wallet_address do %>
                         <div class="flex items-center justify-between">
                           <span class="text-base-content/60">Wallet</span>
-                          <span class="font-mono text-xs">
-                            {String.slice(@credentials.wallet_address || "", 0, 6)}...{String.slice(
-                              @credentials.wallet_address || "",
-                              -4,
-                              4
-                            )}
-                          </span>
+                          <div class="flex items-center gap-1.5">
+                            <span class="font-mono text-xs">
+                              {String.slice(@credentials.wallet_address || "", 0, 6)}...{String.slice(
+                                @credentials.wallet_address || "",
+                                -4,
+                                4
+                              )}
+                            </span>
+                            <button
+                              type="button"
+                              phx-click={
+                                JS.dispatch("phx:copy", detail: %{text: @credentials.wallet_address})
+                              }
+                              class="p-1 rounded text-base-content/30 hover:text-primary hover:bg-primary/10 transition-all"
+                              title="Copy wallet address"
+                            >
+                              <.icon name="hero-clipboard-document" class="size-3.5" />
+                            </button>
+                          </div>
                         </div>
                       <% end %>
                     </div>
@@ -1712,11 +1729,14 @@ defmodule PolyxWeb.HomeLive do
     end
   end
 
+  # Maximum trades to show in live feed - keeps the feed focused on recent activity
+  @max_live_feed_items 25
+
   defp collect_live_feed(tracked_users) do
     tracked_users
     |> Enum.flat_map(fn user ->
+      # Take all trades to sort globally, but we'll limit after sorting
       user.trades
-      |> Enum.take(20)
       |> Enum.map(fn trade ->
         %{
           id: trade["id"] || System.unique_integer([:positive]),
@@ -1743,9 +1763,13 @@ defmodule PolyxWeb.HomeLive do
         }
       end)
     end)
-    # Sort by timestamp (most recent first) for activity feed
+    # Sort by size descending first for deterministic dedup (always keep largest)
+    |> Enum.sort_by(& &1.size, :desc)
+    # Deduplicate by trade_id
+    |> Enum.uniq_by(& &1.trade_id)
+    # Re-sort by timestamp (most recent first) for display
     |> Enum.sort_by(& &1.timestamp, :desc)
-    |> Enum.take(50)
+    |> Enum.take(@max_live_feed_items)
   end
 
   defp parse_trade_value(nil), do: 0.0
@@ -1776,6 +1800,17 @@ defmodule PolyxWeb.HomeLive do
   # Filter live feed by address
   defp filter_feed(feed, nil), do: feed
   defp filter_feed(feed, address), do: Enum.filter(feed, &(&1.address == address))
+
+  # Create a fingerprint of trades for change detection
+  # Uses id + size + usdcSize to detect content changes
+  defp trades_fingerprint(trades) when is_list(trades) do
+    trades
+    |> Enum.map(fn t -> {t["id"], t["size"], t["usdcSize"]} end)
+    |> Enum.sort()
+    |> :erlang.phash2()
+  end
+
+  defp trades_fingerprint(_), do: nil
 
   # Get label for filtered user
   defp get_filter_label(tracked_users, address) do

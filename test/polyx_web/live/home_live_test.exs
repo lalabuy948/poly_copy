@@ -61,6 +61,11 @@ defmodule PolyxWeb.HomeLiveTest do
                "button[phx-click=archive_user][phx-value-address='0xabcdef1234567890abcdef1234567890abcdef12']"
              )
 
+      # Toggle archived section visibility
+      view
+      |> element("button[phx-click=toggle_archived]")
+      |> render_click()
+
       # Verify user is now in archived section with restore button
       assert has_element?(
                view,
@@ -97,7 +102,7 @@ defmodule PolyxWeb.HomeLiveTest do
 
       # Verify settings are updated
       html = render(view)
-      assert html =~ "$25 fixed"
+      assert html =~ "$25 (5 share min)"
     end
   end
 end
