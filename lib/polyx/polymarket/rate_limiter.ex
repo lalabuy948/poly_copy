@@ -41,7 +41,7 @@ defmodule Polyx.Polymarket.RateLimiter do
   - :data - Data API requests (60/min)
   - :gamma - Gamma API requests (60/min)
   """
-  def acquire(bucket, timeout \\ 30_000) do
+  def acquire(bucket, timeout \\ 120_000) do
     GenServer.call(__MODULE__, {:acquire, bucket}, timeout)
   end
 

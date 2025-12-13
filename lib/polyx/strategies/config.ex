@@ -11,11 +11,11 @@ defmodule Polyx.Strategies.Config do
     # Signal threshold - buy when price exceeds this (e.g., 0.80 = 80%)
     field :signal_threshold, :float, default: 0.80
 
-    # Order size in USD
-    field :order_size, :float, default: 5.0
+    # Order size in shares (integer)
+    field :order_size, :integer, default: 10
 
-    # Minimum minutes before resolution to trade
-    field :min_minutes, :float, default: 1.0
+    # Only trade when market has at least this many minutes until resolution
+    field :min_minutes, :float, default: 3.0
 
     # Cooldown between trades on same market (seconds)
     field :cooldown_seconds, :integer, default: 60
@@ -23,8 +23,8 @@ defmodule Polyx.Strategies.Config do
     # Use limit order or market order (buy at current best ask)
     field :use_limit_order, :boolean, default: true
 
-    # Limit price when use_limit_order is true (e.g., 0.99, 0.989, 0.999)
-    field :limit_price, :float, default: 0.99
+    # Limit price when use_limit_order is true (e.g., 0.98, 0.99, 0.989)
+    field :limit_price, :float, default: 0.98
   end
 
   # Hardcoded settings (not exposed in UI)
@@ -50,6 +50,14 @@ defmodule Polyx.Strategies.Config do
   Creates a changeset for config validation.
   """
   def changeset(config, attrs) do
+    # Convert string "true"/"false" from radio buttons to boolean
+    attrs =
+      case attrs["use_limit_order"] do
+        "true" -> Map.put(attrs, "use_limit_order", true)
+        "false" -> Map.put(attrs, "use_limit_order", false)
+        _ -> attrs
+      end
+
     config
     |> cast(attrs, [
       :signal_threshold,
@@ -68,8 +76,10 @@ defmodule Polyx.Strategies.Config do
     |> validate_number(:cooldown_seconds, greater_than_or_equal_to: 0)
     |> validate_number(:limit_price,
       greater_than_or_equal_to: 0.90,
-      less_than_or_equal_to: 1.0
+      less_than_or_equal_to: 0.999,
+      message: "must be between 0.90 and 0.999 (we only buy high-confidence tokens)"
     )
+    |> validate_required([:order_size])
   end
 
   @doc """

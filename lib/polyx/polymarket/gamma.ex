@@ -40,6 +40,30 @@ defmodule Polyx.Polymarket.Gamma do
 
   def get_market_by_token(_), do: {:error, :invalid_token_id}
 
+  @doc """
+  Fetch fresh price for a token directly from API (bypasses cache).
+  Use sparingly - for live price updates when WebSocket has no activity.
+  """
+  def fetch_fresh_price(token_id) when is_binary(token_id) do
+    with :ok <- RateLimiter.acquire(:gamma) do
+      url = "#{@base_url}/markets?clob_token_ids=#{token_id}"
+
+      case Req.get(url, @req_options) do
+        {:ok, %{status: 200, body: [market | _]}} when is_map(market) ->
+          {outcome, price, _opposite} = get_outcome_and_price_for_token(market, token_id)
+          {:ok, %{price: price, outcome: outcome}}
+
+        {:ok, %{status: status}} ->
+          {:error, {:http_error, status}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def fetch_fresh_price(_), do: {:error, :invalid_token_id}
+
   defp fetch_and_cache_market(token_id) do
     with :ok <- RateLimiter.acquire(:gamma) do
       do_fetch_market(token_id, @max_retries)
@@ -221,8 +245,22 @@ defmodule Polyx.Polymarket.Gamma do
     - :limit - Number of events to fetch (default: 50)
   """
   def fetch_15m_crypto_markets(opts \\ []) do
-    with :ok <- RateLimiter.acquire(:gamma) do
-      do_fetch_15m_crypto_markets(opts, @max_retries)
+    # Use try_acquire for non-blocking discovery
+    non_blocking = Keyword.get(opts, :non_blocking, false)
+
+    result =
+      if non_blocking do
+        RateLimiter.try_acquire(:gamma)
+      else
+        RateLimiter.acquire(:gamma)
+      end
+
+    case result do
+      :ok ->
+        do_fetch_15m_crypto_markets(opts, @max_retries)
+
+      {:error, :rate_limited} ->
+        {:error, :rate_limited}
     end
   end
 
@@ -456,12 +494,17 @@ defmodule Polyx.Polymarket.Gamma do
     max_minutes = Keyword.get(opts, :max_minutes, 120)
     min_minutes = Keyword.get(opts, :min_minutes, 1)
     intervals = Keyword.get(opts, :intervals, [:_15m, :_1h, :_4h, :weekly])
+    non_blocking = Keyword.get(opts, :non_blocking, false)
 
     # Fetch from requested interval tags
     results =
       intervals
       |> Enum.map(fn interval ->
-        fetch_opts = [max_minutes: max_minutes, min_minutes: min_minutes]
+        fetch_opts = [
+          max_minutes: max_minutes,
+          min_minutes: min_minutes,
+          non_blocking: non_blocking
+        ]
 
         case interval do
           :_15m -> fetch_15m_crypto_markets(fetch_opts)

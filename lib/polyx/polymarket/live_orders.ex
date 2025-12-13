@@ -21,8 +21,8 @@ defmodule Polyx.Polymarket.LiveOrders do
   # Polymarket requires ping every 10 seconds
   @ping_interval 10_000
 
-  # Batch interval for broadcasting (ms)
-  @batch_interval 100
+  # Batch interval for broadcasting (ms) - reduced for real-time updates
+  @batch_interval 50
 
   # Max orders to batch before forcing a flush
   @max_batch_size 50
@@ -178,9 +178,13 @@ defmodule Polyx.Polymarket.LiveOrders do
 
   @impl Fresh
   def handle_in({:text, message}, state) do
+    # Debug: log all incoming messages (truncated)
+    Logger.debug("[LiveOrders] Received WS message: #{String.slice(message, 0..200)}...")
+
     state =
       case Jason.decode(message) do
         {:ok, %{"event_type" => event_type} = data} ->
+          Logger.debug("[LiveOrders] Event type: #{event_type}")
           handle_event(event_type, data, state)
 
         {:ok, data} when is_list(data) ->

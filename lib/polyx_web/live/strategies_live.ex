@@ -1,12 +1,13 @@
 defmodule PolyxWeb.StrategiesLive do
   use PolyxWeb, :live_view
 
+  require Logger
   alias Polyx.Strategies
   alias Polyx.Strategies.{Engine, Runner, Behaviour, Config}
   alias Polyx.Polymarket.Gamma
 
-  # Batch interval for UI updates (ms) - reduced for more responsive price display
-  @batch_interval 200
+  # Batch interval for UI updates (ms) - maximum real-time responsiveness
+  @batch_interval 50
 
   @impl true
   def mount(_params, _session, socket) do
@@ -51,6 +52,9 @@ defmodule PolyxWeb.StrategiesLive do
      |> assign(:batch_signals, [])
      |> assign(:batch_live_orders, [])
      |> assign(:batch_paper_orders, [])
+     # Price update tracking for visual feedback
+     |> assign(:price_update_count, 0)
+     |> assign(:last_price_update_at, nil)
      |> stream(:events, [])
      |> stream(:live_orders, [])}
   end
@@ -170,7 +174,10 @@ defmodule PolyxWeb.StrategiesLive do
     end
 
     # For auto-discovery mode, fetch discovered tokens asynchronously
-    auto_discover = strategy.config["auto_discover_crypto"] == true
+    # Time decay strategy uses auto-discovery by default (hardcoded in init/1)
+    auto_discover =
+      strategy.config["auto_discover_crypto"] == true or strategy.type == "time_decay"
+
     is_running = Engine.running?(id)
 
     # Auto-recover crashed strategy: if DB says "running" but Runner is dead, restart it
@@ -657,17 +664,28 @@ defmodule PolyxWeb.StrategiesLive do
 
   @impl true
   def handle_info({:price_update, token_id, price_data}, socket) do
+    Logger.debug(
+      "[StrategiesLive] Received price_update for token #{String.slice(token_id, 0..20)}... | price=#{inspect(price_data[:price])} bid=#{inspect(price_data[:best_bid])} ask=#{inspect(price_data[:best_ask])}"
+    )
+
     # Batch price update - will be merged on flush
     existing = Map.get(socket.assigns.batch_price_updates, token_id, %{})
 
+    best_bid = price_data[:best_bid] || existing[:best_bid]
+    best_ask = price_data[:best_ask] || existing[:best_ask]
+
+    # Use trade price if available, otherwise use best_bid
+    # Trade price is from actual executed trades (most accurate)
+    price = price_data[:price] || existing[:price]
+
     updated_data =
       Map.merge(existing, %{
-        best_bid: price_data.best_bid || existing[:best_bid],
-        best_ask: price_data.best_ask || existing[:best_ask],
-        mid: price_data.best_bid || existing[:mid],
-        market_question: price_data.market_question || existing[:market_question],
-        outcome: price_data.outcome || existing[:outcome],
-        updated_at: price_data.updated_at || System.system_time(:millisecond)
+        price: price,
+        best_bid: best_bid,
+        best_ask: best_ask,
+        market_question: price_data[:market_question] || existing[:market_question],
+        outcome: price_data[:outcome] || existing[:outcome],
+        updated_at: price_data[:updated_at] || System.system_time(:millisecond)
       })
 
     batch_price_updates = Map.put(socket.assigns.batch_price_updates, token_id, updated_data)
@@ -689,20 +707,84 @@ defmodule PolyxWeb.StrategiesLive do
   end
 
   @impl true
+  def handle_info({:discovered_tokens, token_ids, tokens_with_metadata}, socket) do
+    require Logger
+    Logger.info("[StrategiesLive] Received #{length(token_ids)} discovered tokens with metadata")
+
+    # Immediately populate with metadata from strategy cache (no API call needed!)
+    new_token_data =
+      token_ids
+      |> Enum.reject(fn token_id -> Map.has_key?(socket.assigns.token_prices, token_id) end)
+      |> Enum.map(fn token_id ->
+        metadata = Map.get(tokens_with_metadata, token_id, %{})
+
+        {token_id,
+         %{
+           best_bid: nil,
+           best_ask: nil,
+           mid: nil,
+           market_question: metadata[:market_question] || "Unknown market",
+           outcome: metadata[:outcome],
+           event_title: metadata[:event_title],
+           end_date: metadata[:end_date],
+           updated_at: System.system_time(:millisecond)
+         }}
+      end)
+      |> Map.new()
+
+    token_prices = Map.merge(socket.assigns.token_prices, new_token_data)
+
+    # Prices will come from WebSocket - no need to fetch from API!
+    {:noreply, assign(socket, :token_prices, token_prices)}
+  end
+
+  # Fallback for old message format (backward compatibility)
+  @impl true
   def handle_info({:discovered_tokens, token_ids}, socket) do
-    # Fetch market info for newly discovered tokens and add to token_prices
-    # Run async to not block the UI
+    require Logger
+    Logger.info("[StrategiesLive] Received #{length(token_ids)} discovered tokens (old format)")
+
+    # Old format without metadata - use placeholders and fetch
+    new_placeholders =
+      token_ids
+      |> Enum.reject(fn token_id -> Map.has_key?(socket.assigns.token_prices, token_id) end)
+      |> Enum.map(fn token_id ->
+        {token_id,
+         %{
+           best_bid: nil,
+           best_ask: nil,
+           mid: nil,
+           market_question: "Loading...",
+           outcome: nil,
+           updated_at: System.system_time(:millisecond)
+         }}
+      end)
+      |> Map.new()
+
+    token_prices = Map.merge(socket.assigns.token_prices, new_placeholders)
+
+    # Fetch market info for newly discovered tokens in background
     send(self(), {:fetch_discovered_prices, token_ids})
-    {:noreply, socket}
+
+    {:noreply, assign(socket, :token_prices, token_prices)}
   end
 
   @impl true
   def handle_info({:fetch_discovered_prices, token_ids}, socket) do
-    # Filter out tokens we already have prices for
+    # Filter out tokens we already have full data for (not just placeholders)
     tokens_to_fetch =
       token_ids
-      |> Enum.reject(fn token_id -> Map.has_key?(socket.assigns.token_prices, token_id) end)
-      |> Enum.take(100)
+      |> Enum.reject(fn token_id ->
+        case Map.get(socket.assigns.token_prices, token_id) do
+          %{market_question: question} when question != "Loading..." and not is_nil(question) ->
+            true
+
+          _ ->
+            false
+        end
+      end)
+      # Fetch in batches to avoid overwhelming the UI - batch size 50
+      |> Enum.take(50)
 
     if tokens_to_fetch == [] do
       {:noreply, socket}
@@ -734,8 +816,8 @@ defmodule PolyxWeb.StrategiesLive do
                 nil
             end
           end,
-          max_concurrency: 10,
-          timeout: 5_000,
+          max_concurrency: 20,
+          timeout: 10_000,
           on_timeout: :kill_task
         )
         |> Enum.reduce([], fn
@@ -770,29 +852,56 @@ defmodule PolyxWeb.StrategiesLive do
           "[StrategiesLive] Got #{length(tokens)} discovered tokens - showing immediately"
         )
 
-        token_list = Enum.take(tokens, 100)
+        # Try to get market cache and prices from Runner state
+        {market_cache, prices} =
+          try do
+            case Runner.get_state(strategy_id) do
+              %{market_cache: cache, prices: prices} when is_map(cache) and is_map(prices) ->
+                {cache, prices}
 
-        # Immediately populate token_prices with placeholder data so spinner dismisses
-        # WebSocket updates will fill in real prices
-        placeholder_prices =
+              %{market_cache: cache} when is_map(cache) ->
+                {cache, %{}}
+
+              _ ->
+                {%{}, %{}}
+            end
+          catch
+            :exit, _ -> {%{}, %{}}
+          end
+
+        Logger.info(
+          "[StrategiesLive] Got #{map_size(market_cache)} cached markets, #{map_size(prices)} prices"
+        )
+
+        # Build token data with metadata and prices from cache
+        token_list = tokens
+
+        new_token_data =
           token_list
+          |> Enum.reject(fn token_id -> Map.has_key?(socket.assigns.token_prices, token_id) end)
           |> Enum.map(fn token_id ->
+            metadata = Map.get(market_cache, token_id, %{})
+            price_data = Map.get(prices, token_id, %{})
+
+            # Use the Gamma API price (actual market price) for display
             {token_id,
              %{
-               best_bid: nil,
-               best_ask: nil,
-               mid: nil,
-               market_question: "Loading...",
-               outcome: nil,
-               updated_at: System.system_time(:millisecond)
+               price: price_data[:price],
+               best_bid: price_data[:best_bid],
+               best_ask: price_data[:best_ask],
+               market_question: metadata[:question] || metadata[:market_question] || "Loading...",
+               event_title: metadata[:event_title],
+               outcome: metadata[:outcome],
+               end_date: metadata[:end_date],
+               updated_at: price_data[:updated_at] || System.system_time(:millisecond)
              }}
           end)
           |> Map.new()
 
-        # Fetch full market info in background
-        send(self(), {:discovered_tokens, token_list})
+        # Merge with existing token_prices
+        token_prices = Map.merge(socket.assigns.token_prices, new_token_data)
 
-        {:noreply, assign(socket, :token_prices, placeholder_prices)}
+        {:noreply, assign(socket, :token_prices, token_prices)}
 
       {:ok, []} ->
         Logger.info("[StrategiesLive] No discovered tokens yet")
@@ -853,6 +962,25 @@ defmodule PolyxWeb.StrategiesLive do
   end
 
   @impl true
+  def handle_info({:strategy_crashed, %{reason: reason}}, socket) do
+    require Logger
+    Logger.warning("[StrategiesLive] Strategy crashed: #{reason}")
+
+    # Show flash notification to user
+    socket =
+      put_flash(
+        socket,
+        :error,
+        "Strategy crashed (auto-restarting): #{String.slice(reason, 0..100)}"
+      )
+
+    # Refresh strategy status after a short delay to show "running" after restart
+    Process.send_after(self(), :refresh_strategies, 2000)
+
+    {:noreply, socket}
+  end
+
+  @impl true
   def handle_info(_msg, socket) do
     {:noreply, socket}
   end
@@ -877,11 +1005,16 @@ defmodule PolyxWeb.StrategiesLive do
       Enum.reduce(updates, socket.assigns.token_prices, fn {token_id, new_data}, acc ->
         existing = Map.get(acc, token_id, %{})
 
+        # Use new price if available, otherwise keep existing
+        price = new_data[:price] || existing[:price]
+        best_bid = new_data[:best_bid] || existing[:best_bid]
+        best_ask = new_data[:best_ask] || existing[:best_ask]
+
         merged =
           Map.merge(existing, %{
-            best_bid: new_data[:best_bid] || existing[:best_bid],
-            best_ask: new_data[:best_ask] || existing[:best_ask],
-            mid: new_data[:mid] || existing[:mid],
+            price: price,
+            best_bid: best_bid,
+            best_ask: best_ask,
             market_question: new_data[:market_question] || existing[:market_question],
             event_title: existing[:event_title],
             event_slug: existing[:event_slug],
@@ -893,9 +1026,13 @@ defmodule PolyxWeb.StrategiesLive do
         Map.put(acc, token_id, merged)
       end)
 
+    update_count = map_size(updates)
+
     socket
     |> assign(:token_prices, token_prices)
     |> assign(:batch_price_updates, %{})
+    |> assign(:price_update_count, socket.assigns.price_update_count + update_count)
+    |> assign(:last_price_update_at, System.system_time(:millisecond))
   end
 
   defp flush_signals(%{assigns: %{batch_signals: []}} = socket), do: socket
@@ -1316,9 +1453,20 @@ defmodule PolyxWeb.StrategiesLive do
                     </div>
                     <%= if live_order.signals do %>
                       <div class="mt-2 pl-2 border-l border-success/30">
-                        <div :for={signal <- live_order.signals} class="text-success text-[11px]">
-                          {signal.action |> to_string() |> String.upcase()}
-                          {signal.size} @ {Float.round(signal.price, 4)} - {signal.reason}
+                        <div
+                          :for={signal <- live_order.signals}
+                          class="text-success text-[11px] font-mono"
+                        >
+                          {signal.action |> to_string() |> String.upcase()}: {if signal[:metadata][
+                                                                                   :shares
+                                                                                 ],
+                                                                                 do:
+                                                                                   "#{signal.metadata.shares} shares",
+                                                                                 else:
+                                                                                   "$#{Float.round(signal.size, 2)}"} @ {Float.round(
+                            signal.price * 100,
+                            1
+                          )}¢
                         </div>
                       </div>
                     <% end %>
@@ -1340,6 +1488,47 @@ defmodule PolyxWeb.StrategiesLive do
                         {map_size(@token_prices)}
                       </span>
                     </div>
+                    <div class="flex items-center gap-3">
+                      <%!-- Price Update Counter --%>
+                      <%= if @price_update_count > 0 do %>
+                        <div class="flex items-center gap-1.5">
+                          <.icon name="hero-arrow-path" class="size-3 text-success/60" />
+                          <span class="text-[9px] text-base-content/50">
+                            {format_number(@price_update_count)} updates
+                          </span>
+                        </div>
+                      <% end %>
+                      <%!-- Last Update Time --%>
+                      <%= if @last_price_update_at do %>
+                        <div class="flex items-center gap-1.5">
+                          <div class={[
+                            "w-1.5 h-1.5 rounded-full bg-success",
+                            if(
+                              System.system_time(:millisecond) - @last_price_update_at < 1000,
+                              do: "animate-pulse",
+                              else: ""
+                            )
+                          ]}>
+                          </div>
+                          <span class="text-[9px] text-base-content/40 font-mono">
+                            {format_time_ago(@last_price_update_at)}
+                          </span>
+                        </div>
+                      <% else %>
+                        <div class="flex items-center gap-1.5">
+                          <div class="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></div>
+                          <span class="text-[9px] text-base-content/40">Live</span>
+                        </div>
+                      <% end %>
+                      <div class="flex items-center gap-1.5">
+                        <span class="text-[10px] text-base-content/50">Signal @</span>
+                        <span class="px-2 py-0.5 rounded-full bg-warning/10 text-warning text-[10px] font-mono font-semibold">
+                          {format_percent(
+                            @selected_strategy.strategy.config["signal_threshold"] || 0.8
+                          )}
+                        </span>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -1360,9 +1549,11 @@ defmodule PolyxWeb.StrategiesLive do
                             )
                         }
                         id={"token-#{token_id}"}
+                        data-token-id={token_id}
+                        phx-hook="PriceFlash"
                         class={[
-                          "p-2 rounded-lg border text-xs",
-                          price_row_class(price_data.best_bid, @selected_strategy.strategy.config)
+                          "p-2 rounded-lg border text-xs transition-colors duration-200",
+                          price_row_class(price_data[:best_bid], @selected_strategy.strategy.config)
                         ]}
                       >
                         <div class="flex items-center justify-between gap-2">
@@ -1395,20 +1586,25 @@ defmodule PolyxWeb.StrategiesLive do
                           </div>
                           <div class="text-right shrink-0">
                             <p class="font-mono font-semibold text-sm">
-                              {format_price_percent(price_data.best_bid || price_data[:mid])}
+                              {format_price_percent(price_data[:price] || price_data[:best_bid])}
                             </p>
                             <p class={[
                               "text-[9px] font-semibold mt-0.5",
                               price_status_text_class(
-                                price_data.best_bid,
+                                price_data[:best_bid],
                                 @selected_strategy.strategy.config
                               )
                             ]}>
                               {price_status_label(
-                                price_data.best_bid,
+                                price_data[:best_bid],
                                 @selected_strategy.strategy.config
                               )}
                             </p>
+                            <%= if price_data[:updated_at] do %>
+                              <p class="text-[8px] text-base-content/30 mt-0.5">
+                                {format_time_ago(price_data[:updated_at])}
+                              </p>
+                            <% end %>
                           </div>
                         </div>
                       </div>
@@ -1511,7 +1707,7 @@ defmodule PolyxWeb.StrategiesLive do
                             <div class="flex justify-between items-center">
                               <span class="text-base-content/60">Order Size</span>
                               <span class="font-medium w-20 text-right">
-                                ${@selected_strategy.strategy.config["order_size"] || 5}
+                                {@selected_strategy.strategy.config["order_size"] || 10} shares
                               </span>
                             </div>
                             <div class="flex justify-between items-center">
@@ -1526,9 +1722,19 @@ defmodule PolyxWeb.StrategiesLive do
                                 {@selected_strategy.strategy.config["cooldown_seconds"] || 60}s
                               </span>
                             </div>
-                            <div class="flex justify-between items-center">
+                            <div class={[
+                              "flex justify-between items-center",
+                              @selected_strategy.strategy.config["use_limit_order"] == false &&
+                                "col-span-2"
+                            ]}>
                               <span class="text-base-content/60">Order Type</span>
-                              <span class="font-medium w-20 text-right">
+                              <span class={[
+                                "font-medium w-20 text-right px-2 py-1 rounded",
+                                @selected_strategy.strategy.config["use_limit_order"] != false &&
+                                  "bg-primary/10 text-primary",
+                                @selected_strategy.strategy.config["use_limit_order"] == false &&
+                                  "bg-success/10 text-success"
+                              ]}>
                                 <%= if @selected_strategy.strategy.config["use_limit_order"] != false do %>
                                   Limit
                                 <% else %>
@@ -1547,6 +1753,41 @@ defmodule PolyxWeb.StrategiesLive do
                                 )}
                               </span>
                             </div>
+                          </div>
+                          <%!-- Strategy Behavior Summary --%>
+                          <div class="mt-3 pt-3 border-t border-base-300">
+                            <p class="text-xs text-base-content/70 leading-relaxed">
+                              <span class="font-semibold text-base-content">Strategy:</span>
+                              When price reaches
+                              <span class="font-mono font-semibold text-warning">
+                                {format_percent(
+                                  @selected_strategy.strategy.config["signal_threshold"] || 0.8
+                                )}
+                              </span>
+                              (within
+                              <span class="font-semibold">
+                                {@selected_strategy.strategy.config["min_minutes"] || 1} min
+                              </span>
+                              of resolution),
+                              <%= if @selected_strategy.strategy.config["use_limit_order"] != false do %>
+                                place limit order for
+                                <span class="font-semibold text-primary">
+                                  {@selected_strategy.strategy.config["order_size"] || 10} shares
+                                </span>
+                                @
+                                <span class="font-mono font-semibold text-primary">
+                                  {format_price_precise(
+                                    @selected_strategy.strategy.config["limit_price"] || 0.99
+                                  )}
+                                </span>
+                              <% else %>
+                                buy
+                                <span class="font-semibold text-success">
+                                  {@selected_strategy.strategy.config["order_size"] || 10} shares
+                                </span>
+                                at market price
+                              <% end %>
+                            </p>
                           </div>
                         </div>
                       </div>
@@ -1614,18 +1855,32 @@ defmodule PolyxWeb.StrategiesLive do
                             <%!-- Use Limit Order --%>
                             <div class="flex justify-between items-center">
                               <span class="text-base-content/60">Order Type</span>
-                              <label class="flex items-center gap-2 cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  name={@config_form[:use_limit_order].name}
-                                  value="true"
-                                  checked={
-                                    Phoenix.HTML.Form.input_value(@config_form, :use_limit_order)
-                                  }
-                                  class="checkbox checkbox-primary checkbox-sm"
-                                />
-                                <span class="text-xs">Limit</span>
-                              </label>
+                              <div class="flex items-center gap-2">
+                                <label class="flex items-center gap-1.5 cursor-pointer">
+                                  <input
+                                    type="radio"
+                                    name={@config_form[:use_limit_order].name}
+                                    value="false"
+                                    checked={
+                                      !Phoenix.HTML.Form.input_value(@config_form, :use_limit_order)
+                                    }
+                                    class="radio radio-primary radio-sm"
+                                  />
+                                  <span class="text-xs">Market</span>
+                                </label>
+                                <label class="flex items-center gap-1.5 cursor-pointer">
+                                  <input
+                                    type="radio"
+                                    name={@config_form[:use_limit_order].name}
+                                    value="true"
+                                    checked={
+                                      Phoenix.HTML.Form.input_value(@config_form, :use_limit_order)
+                                    }
+                                    class="radio radio-primary radio-sm"
+                                  />
+                                  <span class="text-xs">Limit</span>
+                                </label>
+                              </div>
                             </div>
                             <%!-- Limit Price (shown when limit order enabled) --%>
                             <div
@@ -2309,7 +2564,11 @@ defmodule PolyxWeb.StrategiesLive do
   defp format_price_precise(_), do: "-"
 
   # Format shares - use pre-calculated from metadata if available
-  defp format_order_shares(%{metadata: %{shares: shares}}) when is_number(shares) do
+  defp format_order_shares(%{metadata: %{shares: shares}}) when is_integer(shares) do
+    to_string(shares)
+  end
+
+  defp format_order_shares(%{metadata: %{shares: shares}}) when is_float(shares) do
     Float.round(shares, 1) |> to_string()
   end
 
@@ -2339,6 +2598,33 @@ defmodule PolyxWeb.StrategiesLive do
 
   defp format_time(%DateTime{} = dt), do: Calendar.strftime(dt, "%H:%M:%S")
   defp format_time(_), do: ""
+
+  defp format_time_ago(timestamp_ms) when is_integer(timestamp_ms) do
+    now = System.system_time(:millisecond)
+    diff_ms = now - timestamp_ms
+    diff_sec = div(diff_ms, 1000)
+
+    cond do
+      diff_sec < 5 -> "now"
+      diff_sec < 60 -> "#{diff_sec}s"
+      diff_sec < 3600 -> "#{div(diff_sec, 60)}m"
+      true -> "#{div(diff_sec, 3600)}h"
+    end
+  end
+
+  defp format_time_ago(_), do: ""
+
+  defp format_number(num) when is_integer(num) do
+    num
+    |> Integer.to_string()
+    |> String.graphemes()
+    |> Enum.reverse()
+    |> Enum.chunk_every(3)
+    |> Enum.join(",")
+    |> String.reverse()
+  end
+
+  defp format_number(_), do: "0"
 
   # Convert a Trade struct to the paper_order format expected by the UI
   defp trade_to_paper_order(%Polyx.Trades.Trade{} = trade) do
@@ -2385,6 +2671,7 @@ defmodule PolyxWeb.StrategiesLive do
 
   # Sort tokens by absolute distance from current price to target price
   # |target - current| - smaller distance = closer to filling = higher priority
+  # Limit to top 100 tokens to avoid rendering performance issues
   defp sort_by_target_proximity(token_prices, config) do
     high_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
     low_threshold = 0.20
@@ -2393,7 +2680,7 @@ defmodule PolyxWeb.StrategiesLive do
 
     token_prices
     |> Enum.sort_by(fn {_token_id, price_data} ->
-      price = price_data.best_bid || price_data[:mid] || 0.5
+      price = price_data[:best_bid] || price_data[:mid] || 0.5
 
       cond do
         # In high target zone - distance to target_high (e.g., 0.99)
@@ -2412,6 +2699,7 @@ defmodule PolyxWeb.StrategiesLive do
           1.0 + min(distance_to_high, distance_to_low)
       end
     end)
+    |> Enum.take(100)
   end
 
   # Price status helpers for Time Decay strategy
@@ -2440,13 +2728,19 @@ defmodule PolyxWeb.StrategiesLive do
   defp price_status_text_class(_, _), do: "text-base-content/40"
 
   defp price_status_label(price, config) when is_number(price) do
-    high_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
-    target_high = config["limit_price"] || config["target_high_price"] || 0.99
+    signal_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
+    use_limit = config["use_limit_order"] != false
+    limit_price = config["limit_price"] || config["target_high_price"] || 0.99
 
     cond do
-      price > high_threshold -> "TARGET #{Float.round(target_high * 100, 0)}¢"
-      price < 0.20 -> "TARGET 1¢"
-      true -> "WAIT"
+      price >= signal_threshold && use_limit ->
+        "SIGNAL → BUY @ #{Float.round(limit_price * 100, 0)}¢"
+
+      price >= signal_threshold && !use_limit ->
+        "SIGNAL → BUY @ MARKET"
+
+      true ->
+        "WAIT (signal @ #{Float.round(signal_threshold * 100, 0)}¢)"
     end
   end
 

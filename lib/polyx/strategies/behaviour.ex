@@ -99,7 +99,7 @@ defmodule Polyx.Strategies.Behaviour do
       "time_decay" ->
         %{
           # Target price when current price > high_threshold
-          "target_high_price" => 0.99,
+          "target_high_price" => 0.98,
           # Target price when current price < low_threshold
           "target_low_price" => 0.01,
           # Threshold above which we place high-price orders (85% for crypto)
