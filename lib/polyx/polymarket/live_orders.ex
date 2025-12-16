@@ -74,7 +74,6 @@ defmodule Polyx.Polymarket.LiveOrders do
   Subscribe to multiple markets by asset IDs.
   """
   def subscribe_to_markets(asset_ids) when is_list(asset_ids) do
-    Logger.info("[LiveOrders] Subscribing to #{length(asset_ids)} markets")
 
     # Store in ETS for re-subscription on reconnect (survives process restarts)
     store_subscriptions(asset_ids)
@@ -86,6 +85,30 @@ defmodule Polyx.Polymarket.LiveOrders do
       Process.send_after(pid, {:resubscribe_batch, asset_ids}, 200)
     end
   end
+
+  @doc """
+  Remove subscriptions for resolved/expired markets.
+  Call this when markets are cleaned up to prevent unbounded ETS growth.
+  """
+  def unsubscribe_from_markets(asset_ids) when is_list(asset_ids) and asset_ids != [] do
+    ensure_ets_table()
+
+    existing =
+      case :ets.lookup(@subscriptions_table, :markets) do
+        [{:markets, set}] -> set
+        [] -> MapSet.new()
+      end
+
+    to_remove = MapSet.new(asset_ids)
+    updated = MapSet.difference(existing, to_remove)
+    :ets.insert(@subscriptions_table, {:markets, updated})
+
+    Logger.debug(
+      "[LiveOrders] Removed #{length(asset_ids)} subscriptions, #{MapSet.size(updated)} remaining"
+    )
+  end
+
+  def unsubscribe_from_markets([]), do: :ok
 
   # ETS helpers for persistent subscription tracking
 
@@ -114,7 +137,6 @@ defmodule Polyx.Polymarket.LiveOrders do
 
     updated = Enum.reduce(asset_ids, existing, &MapSet.put(&2, &1))
     :ets.insert(@subscriptions_table, {:markets, updated})
-    Logger.debug("[LiveOrders] Stored #{MapSet.size(updated)} total subscriptions in ETS")
   end
 
   defp get_stored_subscriptions do
@@ -164,8 +186,6 @@ defmodule Polyx.Polymarket.LiveOrders do
 
   @impl Fresh
   def handle_in({:text, message}, state) do
-    # Debug: log all incoming messages (truncated)
-    # Logger.debug("[LiveOrders] Received WS message: #{String.slice(message, 0..200)}...")
 
     state =
       case Jason.decode(message) do
@@ -229,7 +249,7 @@ defmodule Polyx.Polymarket.LiveOrders do
   end
 
   def handle_info({:send_subscription_batch, asset_ids}, state) do
-    msg = Jason.encode!(%{assets_ids: asset_ids, type: "MARKET"})
+    msg = Jason.encode!(%{assets_ids: asset_ids, type: "market"})
     Fresh.send(__MODULE__, {:text, msg})
     {:ok, state}
   end

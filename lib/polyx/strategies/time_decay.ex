@@ -226,13 +226,6 @@ defmodule Polyx.Strategies.TimeDecay do
         # Find newly discovered tokens
         new_tokens = MapSet.difference(all_tokens, state.discovered_tokens)
 
-        if MapSet.size(new_tokens) > 0 do
-          event_titles = events |> Enum.map(& &1[:title]) |> Enum.take(5) |> Enum.join(", ")
-
-          Logger.info(
-            "[TimeDecay] Discovered #{MapSet.size(new_tokens)} new crypto tokens from #{length(events)} events: #{event_titles}"
-          )
-        end
 
         # Update discovered tokens
         state = %{state | discovered_tokens: MapSet.union(state.discovered_tokens, new_tokens)}
@@ -579,12 +572,6 @@ defmodule Polyx.Strategies.TimeDecay do
         # Find tokens that were discovered but are no longer active (resolved)
         resolved = MapSet.difference(state.discovered_tokens, active_tokens) |> MapSet.to_list()
 
-        if resolved != [] do
-          Logger.info(
-            "[TimeDecay] 🧹 Removing #{length(resolved)} resolved markets from watch list"
-          )
-        end
-
         # Update state with only active tokens
         new_state = %{
           state
@@ -658,7 +645,7 @@ defmodule Polyx.Strategies.TimeDecay do
           size: effective_size,
           reason:
             "Time decay BUY - #{market_info[:outcome] || "YES"} at #{pct(current_price)}, " <>
-              "#{hours_label(market_info)} to resolution, target #{pct(target_price)}",
+              "#{hours_label(market_info)} to resolution, limit #{pct(target_price)}",
           metadata: %{
             strategy: "time_decay",
             current_price: current_price,

@@ -54,6 +54,13 @@ defmodule Polyx.Strategies.Runner do
   end
 
   @doc """
+  Set paper_mode for a running strategy.
+  """
+  def set_paper_mode(strategy_id, paper_mode) when is_boolean(paper_mode) do
+    GenServer.call(via_tuple(strategy_id), {:set_paper_mode, paper_mode})
+  end
+
+  @doc """
   Get discovered tokens from a running strategy.
   Returns {:ok, list} - reads from ETS for non-blocking access.
   """
@@ -152,10 +159,7 @@ defmodule Polyx.Strategies.Runner do
 
             # Schedule initial discovery async if needed (don't block init)
             needs_discovery = Map.get(strategy_state, :needs_initial_discovery, false)
-            Logger.info("[Runner] needs_initial_discovery=#{needs_discovery}")
-
             if needs_discovery do
-              Logger.info("[Runner] Scheduling initial discovery...")
               send(self(), :initial_discovery)
             end
 
@@ -189,6 +193,14 @@ defmodule Polyx.Strategies.Runner do
     Strategies.update_strategy_status(state.strategy, "running")
     Strategies.log_event(state.strategy, "info", "Strategy resumed")
     {:reply, :ok, %{state | paused: false}}
+  end
+
+  @impl true
+  def handle_call({:set_paper_mode, paper_mode}, _from, state) do
+    updated_strategy = %{state.strategy | paper_mode: paper_mode}
+    mode_label = if paper_mode, do: "Paper", else: "Live"
+    Strategies.log_event(state.strategy, "info", "Switched to #{mode_label} mode")
+    {:reply, :ok, %{state | strategy: updated_strategy}}
   end
 
   @impl true
@@ -246,12 +258,6 @@ defmodule Polyx.Strategies.Runner do
 
   @impl true
   def handle_info(:initial_discovery, state) do
-    Logger.info("[Runner] *** INITIAL DISCOVERY TRIGGERED ***")
-    Logger.info("[Runner] Module: #{inspect(state.module)}")
-
-    Logger.info(
-      "[Runner] Has discover_crypto_markets?: #{function_exported?(state.module, :discover_crypto_markets, 1)}"
-    )
 
     # Call discover function if the module supports it
     new_state =
@@ -313,6 +319,8 @@ defmodule Polyx.Strategies.Runner do
         store_discovered_tokens(state.strategy_id, MapSet.to_list(current_discovered))
         # Broadcast removal to UI
         broadcast_removed_tokens(state.strategy_id, removed_tokens)
+        # Unsubscribe from LiveOrders ETS to prevent memory leak
+        LiveOrders.unsubscribe_from_markets(removed_tokens)
         # Clear removed_tokens from state to avoid re-broadcasting
         cleaned_strategy_state = Map.put(new_state.state, :removed_tokens, [])
         # Also remove from WebSocket subscribed set and resolution times
@@ -347,7 +355,6 @@ defmodule Polyx.Strategies.Runner do
             get_priority_tokens_for_subscription(new_state.state)
 
           # Subscribe ALL new tokens to WebSocket
-          Logger.info("[Runner] 🚀 Subscribing #{length(new_token_list)} new tokens to WebSocket")
           LiveOrders.subscribe_to_markets(new_token_list)
 
           %{
@@ -370,8 +377,7 @@ defmodule Polyx.Strategies.Runner do
 
   @impl true
   def handle_info(:refresh_prices, state) do
-    # WebSocket-only price updates - no Gamma API polling
-    # Just reschedule the timer (kept for potential future use)
+    # WebSocket is the only source of prices - no API polling
     price_refresh_ref = Process.send_after(self(), :refresh_prices, @price_refresh_interval)
     {:noreply, %{state | price_refresh_ref: price_refresh_ref}}
   end
@@ -421,7 +427,6 @@ defmodule Polyx.Strategies.Runner do
       # Get resolution times for tracking
       {_priority_tokens, resolution_times} = get_priority_tokens_for_subscription(strategy_state)
 
-      Logger.info("[Runner] 🚀 Subscribing ALL #{length(token_list)} tokens to WebSocket")
       LiveOrders.subscribe_to_markets(token_list)
 
       # Schedule immediate price refresh to seed initial prices
@@ -730,8 +735,6 @@ defmodule Polyx.Strategies.Runner do
   end
 
   defp broadcast_discovered_tokens(strategy_id, token_ids) do
-    Logger.info("[Runner] Broadcasting #{length(token_ids)} newly discovered tokens")
-
     Phoenix.PubSub.broadcast(
       Polyx.PubSub,
       "strategies:#{strategy_id}",
@@ -740,8 +743,6 @@ defmodule Polyx.Strategies.Runner do
   end
 
   defp broadcast_removed_tokens(strategy_id, token_ids) do
-    Logger.info("[Runner] Broadcasting #{length(token_ids)} removed tokens (resolved markets)")
-
     Phoenix.PubSub.broadcast(
       Polyx.PubSub,
       "strategies:#{strategy_id}",
