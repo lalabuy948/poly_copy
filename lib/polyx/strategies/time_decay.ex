@@ -10,13 +10,13 @@ defmodule Polyx.Strategies.TimeDecay do
 
   Config options:
   - high_threshold: Price above which we BUY (default: 0.90)
-  - target_high_price: Limit price for buy orders (default: 0.98)
-  - order_size: Number of shares to buy (integer, default: 10)
+  - target_high_price: Limit price for buy orders (default: 0.99)
+  - order_size: Base order size in USD (default: 10)
   - cooldown_seconds: Cooldown between orders per market (default: 300)
   - min_spread: Maximum spread to tolerate (default: 0.02)
   - use_midpoint: Use midpoint price instead of best_bid (default: true)
-  - max_minutes_to_resolution: Discovery finds ALL markets expiring within next N minutes (default: 15)
-  - min_minutes: Only trade when market has at least this many minutes left (default: 3)
+  - max_minutes_to_resolution: For discovery, find markets expiring within N minutes (default: 15)
+  - min_minutes: Only trade when this many minutes or LESS remain (default: 2)
   - min_profit: Minimum estimated profit in USD to signal (default: 0.01)
   - auto_discover_crypto: Automatically discover 15-min crypto markets (default: false)
   """
@@ -97,7 +97,7 @@ defmodule Polyx.Strategies.TimeDecay do
         {:error, "signal_threshold must be between 0.5 and 0.99"}
 
       order_size != nil and order_size <= 0 ->
-        {:error, "order_size must be a positive integer (number of shares)"}
+        {:error, "order_size must be a positive number"}
 
       limit_price != nil and (limit_price < 0.9 or limit_price > 1.0) ->
         {:error, "limit_price must be between 0.9 and 1.0"}
@@ -156,43 +156,13 @@ defmodule Polyx.Strategies.TimeDecay do
     # Auto-discovery of 15-min crypto markets (runs more frequently)
     auto_discover = config["auto_discover_crypto"] == true
     discovery_interval = config["discovery_interval_seconds"] || 30
-    time_since_last = now - state.last_crypto_discovery
 
     state =
-      if auto_discover and time_since_last >= discovery_interval do
-        # Spawn async discovery task to avoid blocking on rate limiter
-        parent = self()
-
-        Task.start(fn ->
-          try do
-            # Set a task-level timeout to prevent hanging forever
-            task_result =
-              Task.async(fn ->
-                discover_crypto_markets(state)
-              end)
-              |> Task.await(90_000)
-
-            case task_result do
-              {:ok, new_state} ->
-                send(parent, {:discovery_complete, new_state})
-
-              _ ->
-                Logger.warning("[TimeDecay] Discovery returned unexpected result")
-                send(parent, :discovery_failed)
-            end
-          rescue
-            e ->
-              Logger.error("[TimeDecay] Discovery task crashed: #{inspect(e)}")
-              send(parent, :discovery_failed)
-          catch
-            :exit, {:timeout, _} ->
-              Logger.error("[TimeDecay] Discovery task timed out after 90s")
-              send(parent, :discovery_failed)
-          end
-        end)
-
-        # Mark discovery as attempted (update timestamp immediately)
-        %{state | last_crypto_discovery: now}
+      if auto_discover and now - state.last_crypto_discovery >= discovery_interval do
+        case discover_crypto_markets(state) do
+          {:ok, new_state} ->
+            %{new_state | last_crypto_discovery: now}
+        end
       else
         state
       end
@@ -225,27 +195,23 @@ defmodule Polyx.Strategies.TimeDecay do
   end
 
   # Discover crypto markets within the configured time window (default: 15 min)
-  # Discovery finds ALL markets expiring within max_minutes (from 0 to max_minutes)
-  # The min_minutes config is only used in trading decision logic, NOT discovery
   # Public so Runner can call it
   def discover_crypto_markets(state) do
     config = state.config
     max_minutes = config["max_minutes_to_resolution"] || 15
+    min_minutes = config["min_minutes_to_resolution"] || 1
+    market_timeframe = config["market_timeframe"] || "15m"
+
+    # Map timeframe to Gamma API interval
+    intervals = timeframe_to_intervals(market_timeframe)
 
     case Gamma.fetch_crypto_markets_ending_soon(
            max_minutes: max_minutes,
-           min_minutes: 0,
-           limit: 100,
-           intervals: [:_15m],
-           non_blocking: true
+           min_minutes: min_minutes,
+           intervals: intervals,
+           limit: 100
          ) do
-      {:error, :rate_limited} ->
-        Logger.info("[TimeDecay] ⏳ Rate limited, will retry on next discovery cycle")
-        {:ok, state}
-
       {:ok, events} ->
-        Logger.info("[TimeDecay] 📡 Discovery: API returned #{length(events)} events")
-
         # Extract all token IDs from discovered markets
         all_tokens =
           events
@@ -261,21 +227,18 @@ defmodule Polyx.Strategies.TimeDecay do
         new_tokens = MapSet.difference(all_tokens, state.discovered_tokens)
 
         if MapSet.size(new_tokens) > 0 do
-          event_titles = events |> Enum.map(& &1[:title]) |> Enum.take(3) |> Enum.join(", ")
+          event_titles = events |> Enum.map(& &1[:title]) |> Enum.take(5) |> Enum.join(", ")
 
           Logger.info(
-            "[TimeDecay] ✅ NEW: #{MapSet.size(new_tokens)} tokens (#{MapSet.size(all_tokens)} total) - #{event_titles}..."
+            "[TimeDecay] Discovered #{MapSet.size(new_tokens)} new crypto tokens from #{length(events)} events: #{event_titles}"
           )
-        else
-          if MapSet.size(all_tokens) > 0 do
-            Logger.info("[TimeDecay] ⏸️  Already tracking #{MapSet.size(all_tokens)} tokens")
-          end
         end
 
         # Update discovered tokens
         state = %{state | discovered_tokens: MapSet.union(state.discovered_tokens, new_tokens)}
 
-        # Build list of tokens to cache (not yet evaluated)
+        # Build list of tokens to cache
+        # Include tokens that are missing opposite_token_id in cache (for cooldown logic)
         tokens_to_cache =
           events
           |> Enum.flat_map(fn event ->
@@ -287,64 +250,46 @@ defmodule Polyx.Strategies.TimeDecay do
             end)
           end)
           |> Enum.filter(fn {token_id, _event, _market} ->
-            not MapSet.member?(state.evaluated_tokens, token_id)
+            # Cache if not evaluated OR if missing opposite_token_id (migration case)
+            not MapSet.member?(state.evaluated_tokens, token_id) or
+              is_nil(get_in(state.market_cache, [token_id, :opposite_token_id]))
           end)
 
-        # Cache market info AND initial prices from Gamma API
+        # Cache market info (fast, no API calls) - prices come from WebSocket
         state =
           Enum.reduce(tokens_to_cache, state, fn {token_id, event, market}, st ->
-            # Get outcome data which includes price
-            outcome_data = get_outcome_data_for_token(market, token_id)
+            # Find the opposite token (for cooldown logic - one trade per market)
+            token_ids = market[:token_ids] || []
+            opposite_token_id = Enum.find(token_ids, fn id -> id != token_id end)
 
             market_info = %{
               question: market[:question],
               event_title: event[:title],
-              outcome: outcome_data[:name],
+              outcome: get_outcome_for_token(market, token_id),
+              opposite_token_id: opposite_token_id,
               end_date: event[:end_date],
               expires_at: System.system_time(:second) + 300
             }
 
-            # Store initial price from Gamma API (the actual market price)
-            # Also store as 'price' which is the display price
-            price_data =
-              if outcome_data[:price] do
-                %{
-                  price: outcome_data[:price],
-                  best_bid: outcome_data[:price],
-                  best_ask: outcome_data[:price],
-                  updated_at: System.system_time(:millisecond)
-                }
-              else
-                nil
-              end
-
-            st = %{
+            %{
               st
               | evaluated_tokens: MapSet.put(st.evaluated_tokens, token_id),
                 market_cache: Map.put(st.market_cache, token_id, market_info)
             }
-
-            # Also store price if available
-            if price_data do
-              %{st | prices: Map.put(st.prices, token_id, price_data)}
-            else
-              st
-            end
           end)
 
-        # WebSocket will provide real-time price updates
+        # Don't fetch orderbooks during discovery - WebSocket will provide real-time prices
         # Signals will be generated when price updates arrive via handle_order
         {:ok, state}
     end
   end
 
-  # Returns full outcome data including price
-  defp get_outcome_data_for_token(market, token_id) do
+  defp get_outcome_for_token(market, token_id) do
     outcomes = market[:outcomes] || []
 
     case Enum.find(outcomes, fn o -> o[:token_id] == token_id end) do
-      %{} = outcome -> outcome
-      _ -> %{}
+      %{name: name} -> name
+      _ -> nil
     end
   end
 
@@ -506,10 +451,10 @@ defmodule Polyx.Strategies.TimeDecay do
 
     # User-configurable settings (new simplified config)
     signal_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
-    order_size = config["order_size"] || 10
+    order_size = config["order_size"] || 5.0
     min_minutes = config["min_minutes"] || config["min_minutes_to_resolution"] || 1.0
     use_limit_order = config["use_limit_order"] != false
-    limit_price = config["limit_price"] || config["target_high_price"] || 0.98
+    limit_price = config["limit_price"] || config["target_high_price"] || 0.99
 
     # Hardcoded settings
     cooldown_seconds = config["cooldown_seconds"] || 60
@@ -533,14 +478,13 @@ defmodule Polyx.Strategies.TimeDecay do
       # Check time to resolution (minutes-based for crypto markets)
       minutes_to_resolution = calculate_minutes_to_resolution(market_info[:end_date])
 
-      # Time constraints: must be >= min_minutes (trade when at least this many minutes remain)
-      # min_minutes means "minimum time before resolution to start trading"
-      # Example: min_minutes=3 means start trading when market has 3+ minutes left
+      # Time constraints: must be <= min_minutes (only trade very close to expiry)
+      # min_minutes means "only trade when this many minutes or less remain"
       time_ok =
         cond do
           is_nil(minutes_to_resolution) -> false
           minutes_to_resolution <= 0 -> false
-          minutes_to_resolution < min_minutes -> false
+          minutes_to_resolution > min_minutes -> false
           true -> true
         end
 
@@ -563,16 +507,8 @@ defmodule Polyx.Strategies.TimeDecay do
 
         # HIGH PRICE: Token likely resolving to 1.0 - BUY!
         current_price > signal_threshold ->
-          Logger.info(
-            "[TimeDecay] 🎯 OPPORTUNITY: #{asset_id} at #{pct(current_price)} > #{pct(signal_threshold)} (#{Float.round(minutes_to_resolution || 0, 1)} min left)"
-          )
-
           # Determine buy price: limit order uses limit_price, market order uses best_ask
           buy_price = if use_limit_order, do: limit_price, else: best_ask
-
-          Logger.info(
-            "[TimeDecay] 💰 ORDER PRICE: use_limit_order=#{use_limit_order}, limit_price=#{pct(limit_price)}, best_ask=#{pct(best_ask || 0)}, buy_price=#{pct(buy_price)}"
-          )
 
           generate_buy_signal(
             state,
@@ -615,49 +551,53 @@ defmodule Polyx.Strategies.TimeDecay do
     end)
   end
 
-  # Clean up resolved markets from discovered tokens
+  # Clean up resolved markets by refetching active markets from Gamma
   defp cleanup_resolved_markets(state) do
-    now = DateTime.utc_now()
+    config = state.config
+    max_minutes = config["max_minutes_to_resolution"] || 15
+    min_minutes = config["min_minutes_to_resolution"] || 1
+    market_timeframe = config["market_timeframe"] || "15m"
+    intervals = timeframe_to_intervals(market_timeframe)
 
-    {still_valid, resolved} =
-      state.discovered_tokens
-      |> MapSet.to_list()
-      |> Enum.split_with(fn token_id ->
-        case Map.get(state.market_cache, token_id) do
-          %{end_date: end_date} when not is_nil(end_date) ->
-            case parse_end_date(end_date) do
-              {:ok, end_dt} ->
-                # Keep if more than 0 seconds until resolution
-                DateTime.diff(end_dt, now, :second) > 0
+    # Refetch currently active markets
+    case Gamma.fetch_crypto_markets_ending_soon(
+           max_minutes: max_minutes,
+           min_minutes: min_minutes,
+           intervals: intervals,
+           limit: 100
+         ) do
+      {:ok, events} ->
+        # Get all currently active token IDs
+        active_tokens =
+          events
+          |> Enum.flat_map(fn event ->
+            (event[:markets] || [])
+            |> Enum.flat_map(fn market -> market[:token_ids] || [] end)
+          end)
+          |> MapSet.new()
 
-              _ ->
-                # Can't parse date - keep it
-                true
-            end
+        # Find tokens that were discovered but are no longer active (resolved)
+        resolved = MapSet.difference(state.discovered_tokens, active_tokens) |> MapSet.to_list()
 
-          _ ->
-            # No cached info - keep it for now
-            true
+        if resolved != [] do
+          Logger.info(
+            "[TimeDecay] 🧹 Removing #{length(resolved)} resolved markets from watch list"
+          )
         end
-      end)
 
-    if resolved != [] do
-      Logger.info("[TimeDecay] 🧹 Removing #{length(resolved)} resolved markets from watch list")
+        # Update state with only active tokens
+        new_state = %{
+          state
+          | discovered_tokens: MapSet.intersection(state.discovered_tokens, active_tokens),
+            prices: Map.drop(state.prices, resolved),
+            cooldowns: Map.drop(state.cooldowns, resolved),
+            placed_orders: Map.drop(state.placed_orders, resolved),
+            evaluated_tokens: MapSet.difference(state.evaluated_tokens, MapSet.new(resolved)),
+            removed_tokens: resolved
+        }
+
+        {new_state, resolved}
     end
-
-    # Update state with cleaned tokens
-    new_state = %{
-      state
-      | discovered_tokens: MapSet.new(still_valid),
-        # Also clean up related caches
-        prices: Map.drop(state.prices, resolved),
-        cooldowns: Map.drop(state.cooldowns, resolved),
-        placed_orders: Map.drop(state.placed_orders, resolved),
-        evaluated_tokens: MapSet.difference(state.evaluated_tokens, MapSet.new(resolved)),
-        removed_tokens: resolved
-    }
-
-    {new_state, resolved}
   end
 
   # Calculate minutes until market resolution
@@ -688,14 +628,15 @@ defmodule Polyx.Strategies.TimeDecay do
          market_info,
          order
        ) do
-    # order_size is now the number of shares (integer)
-    shares = order_size
-    # Calculate USD value for validation and profit estimation
-    usd_value = shares * target_price
-    estimated_profit = estimate_profit_from_shares(:buy, target_price, shares)
+    # Calculate size accounting for fees
+    effective_size = calculate_effective_size(order_size, target_price, :buy)
+
+    # Check minimum requirements
+    shares = effective_size / target_price
+    estimated_profit = estimate_profit(:buy, target_price, effective_size)
 
     cond do
-      usd_value < @min_order_value ->
+      effective_size < @min_order_value ->
         :no_opportunity
 
       shares < @min_shares ->
@@ -714,7 +655,7 @@ defmodule Polyx.Strategies.TimeDecay do
           action: :buy,
           token_id: asset_id,
           price: target_price,
-          size: shares,
+          size: effective_size,
           reason:
             "Time decay BUY - #{market_info[:outcome] || "YES"} at #{pct(current_price)}, " <>
               "#{hours_label(market_info)} to resolution, target #{pct(target_price)}",
@@ -741,12 +682,18 @@ defmodule Polyx.Strategies.TimeDecay do
 
         cooldowns =
           if opposite_token_id = market_info[:opposite_token_id] do
+            Logger.info(
+              "[TimeDecay] 🔒 Setting cooldown for BOTH tokens: #{String.slice(asset_id, 0, 8)}... AND #{String.slice(opposite_token_id, 0, 8)}..."
+            )
+
             Map.put(cooldowns, opposite_token_id, cooldown_until)
           else
+            Logger.warning(
+              "[TimeDecay] ⚠️ No opposite token found for #{String.slice(asset_id, 0, 8)}... - only this token on cooldown"
+            )
+
             cooldowns
           end
-
-        Logger.debug("[TimeDecay] Set cooldown for market (both tokens) until #{cooldown_until}")
 
         placed_orders = Map.put(state.placed_orders, asset_id, signal)
 
@@ -777,39 +724,12 @@ defmodule Polyx.Strategies.TimeDecay do
         # Cache for 5 minutes
         cached_info = Map.put(info, :expires_at, System.system_time(:second) + 300)
         new_cache = Map.put(state.market_cache, asset_id, cached_info)
-
-        # Prevent unbounded cache growth: limit to 200 entries
-        new_cache =
-          if map_size(new_cache) > 200 do
-            Logger.warning(
-              "[TimeDecay] ⚠️ Market cache exceeded 200 entries, cleaning expired entries"
-            )
-
-            clean_expired_cache(new_cache)
-          else
-            new_cache
-          end
-
         {info[:outcome], info, %{state | market_cache: new_cache}}
 
       {:error, _} ->
         # No info available, assume YES token
         {nil, %{}, state}
     end
-  end
-
-  # Remove expired entries from market cache
-  defp clean_expired_cache(cache) do
-    now = System.system_time(:second)
-
-    cache
-    |> Enum.reject(fn {_token_id, info} ->
-      case info do
-        %{expires_at: exp} when is_integer(exp) -> exp < now
-        _ -> false
-      end
-    end)
-    |> Map.new()
   end
 
   defp parse_end_date(nil), do: {:error, nil}
@@ -850,14 +770,18 @@ defmodule Polyx.Strategies.TimeDecay do
   defp calculate_spread(_, nil), do: nil
   defp calculate_spread(best_bid, best_ask), do: best_ask - best_bid
 
-  # Estimate profit from trade (using shares directly)
-  defp estimate_profit_from_shares(:buy, target_price, shares) do
+  # Calculate effective order size after fees
+  defp calculate_effective_size(order_size, _price, :buy) do
+    # For buys, reduce size by taker fee
+    order_size * (1 - @taker_fee)
+  end
+
+  # Estimate profit from trade
+  defp estimate_profit(:buy, target_price, size) do
     # If resolves to 1, profit = (1 - target_price) * shares - fees
-    # Fee is paid on the cost (shares * target_price)
-    cost = shares * target_price
-    fee = cost * @taker_fee
+    shares = size / target_price
     gross = (1 - target_price) * shares
-    gross - fee
+    gross * (1 - @taker_fee)
   end
 
   defp in_cooldown?(state, token_id) do
@@ -881,4 +805,11 @@ defmodule Polyx.Strategies.TimeDecay do
   end
 
   defp hours_label(_), do: "unknown time"
+
+  # Map market timeframe config to Gamma API intervals
+  defp timeframe_to_intervals("15m"), do: [:_15m]
+  defp timeframe_to_intervals("1h"), do: [:_1h]
+  defp timeframe_to_intervals("4h"), do: [:_4h]
+  defp timeframe_to_intervals("daily"), do: [:weekly]
+  defp timeframe_to_intervals(_), do: [:_15m]
 end

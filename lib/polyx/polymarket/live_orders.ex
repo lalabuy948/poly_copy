@@ -74,23 +74,16 @@ defmodule Polyx.Polymarket.LiveOrders do
   Subscribe to multiple markets by asset IDs.
   """
   def subscribe_to_markets(asset_ids) when is_list(asset_ids) do
-    # Polymarket uses "assets_ids" (plural) and "MARKET" (uppercase)
-    msg =
-      Jason.encode!(%{
-        assets_ids: asset_ids,
-        type: "MARKET"
-      })
-
     Logger.info("[LiveOrders] Subscribing to #{length(asset_ids)} markets")
 
     # Store in ETS for re-subscription on reconnect (survives process restarts)
     store_subscriptions(asset_ids)
 
-    # Use delayed send to ensure connection is ready
+    # Use batched subscription to avoid overwhelming the server
     pid = Process.whereis(__MODULE__)
 
     if pid do
-      Process.send_after(pid, {:delayed_subscribe, msg}, 200)
+      Process.send_after(pid, {:resubscribe_batch, asset_ids}, 200)
     end
   end
 
@@ -144,16 +137,9 @@ defmodule Polyx.Polymarket.LiveOrders do
     asset_ids = get_stored_subscriptions()
 
     if asset_ids != [] do
-      Logger.info("[LiveOrders] Will re-subscribe to #{length(asset_ids)} markets in 500ms")
-
-      msg =
-        Jason.encode!(%{
-          assets_ids: asset_ids,
-          type: "MARKET"
-        })
-
-      # Schedule re-subscription after connection is fully established (500ms delay)
-      Process.send_after(self(), {:resubscribe, msg}, 500)
+      Logger.info("[LiveOrders] Will re-subscribe to #{length(asset_ids)} markets in batches")
+      # Schedule batched re-subscription after connection is fully established
+      Process.send_after(self(), {:resubscribe_batch, asset_ids}, 500)
     end
 
     {:ok, %{state | subscribed: false, order_batch: [], batch_timer: nil}}
@@ -179,12 +165,12 @@ defmodule Polyx.Polymarket.LiveOrders do
   @impl Fresh
   def handle_in({:text, message}, state) do
     # Debug: log all incoming messages (truncated)
-    Logger.debug("[LiveOrders] Received WS message: #{String.slice(message, 0..200)}...")
+    # Logger.debug("[LiveOrders] Received WS message: #{String.slice(message, 0..200)}...")
 
     state =
       case Jason.decode(message) do
         {:ok, %{"event_type" => event_type} = data} ->
-          Logger.debug("[LiveOrders] Event type: #{event_type}")
+          # Logger.debug("[LiveOrders] Event type: #{event_type}")
           handle_event(event_type, data, state)
 
         {:ok, data} when is_list(data) ->
@@ -221,10 +207,29 @@ defmodule Polyx.Polymarket.LiveOrders do
   end
 
   def handle_info({:resubscribe, msg}, state) do
-    # Send re-subscription message after reconnect with slight delay
+    # Send re-subscription message after reconnect
     Logger.info("[LiveOrders] Sending re-subscription message")
-    # Small delay to ensure connection is fully ready
-    Process.sleep(100)
+    Fresh.send(__MODULE__, {:text, msg})
+    {:ok, state}
+  end
+
+  def handle_info({:resubscribe_batch, asset_ids}, state) do
+    # Subscribe in batches to avoid overwhelming the server
+    batch_size = 20
+
+    asset_ids
+    |> Enum.chunk_every(batch_size)
+    |> Enum.with_index()
+    |> Enum.each(fn {batch, idx} ->
+      # Stagger batches by 200ms each
+      Process.send_after(self(), {:send_subscription_batch, batch}, idx * 200)
+    end)
+
+    {:ok, state}
+  end
+
+  def handle_info({:send_subscription_batch, asset_ids}, state) do
+    msg = Jason.encode!(%{assets_ids: asset_ids, type: "MARKET"})
     Fresh.send(__MODULE__, {:text, msg})
     {:ok, state}
   end

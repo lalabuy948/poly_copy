@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mix compile:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(mix precommit:*)"
+    ]
+  }
+}
