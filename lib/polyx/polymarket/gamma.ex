@@ -10,7 +10,7 @@ defmodule Polyx.Polymarket.Gamma do
   @search_url "https://search-api.polymarket.com"
 
   # Disable automatic retries to avoid 429 spam in logs
-  @req_options [retry: false, receive_timeout: 10_000]
+  @req_options [retry: false, receive_timeout: 30_000]
 
   @max_retries 3
 

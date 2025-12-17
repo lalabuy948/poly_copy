@@ -39,7 +39,8 @@ defmodule Polyx.Strategies.TimeDecay do
         %{
           "auto_discover_crypto" => true,
           "crypto_only" => true,
-          "max_minutes_to_resolution" => 15,
+          # Increased from 15 to 60 minutes
+          "max_minutes_to_resolution" => 60,
           "cooldown_seconds" => 60,
           "min_profit" => 0.01,
           "discovery_interval_seconds" => 30,
@@ -198,9 +199,14 @@ defmodule Polyx.Strategies.TimeDecay do
   # Public so Runner can call it
   def discover_crypto_markets(state) do
     config = state.config
-    max_minutes = config["max_minutes_to_resolution"] || 15
+    # Use new default
+    max_minutes = config["max_minutes_to_resolution"] || 60
     min_minutes = config["min_minutes_to_resolution"] || 1
     market_timeframe = config["market_timeframe"] || "15m"
+
+    Logger.info(
+      "[TimeDecay] Starting crypto discovery: max_minutes=#{max_minutes}, min_minutes=#{min_minutes}"
+    )
 
     # Map timeframe to Gamma API interval
     intervals = timeframe_to_intervals(market_timeframe)
@@ -212,6 +218,8 @@ defmodule Polyx.Strategies.TimeDecay do
            limit: 100
          ) do
       {:ok, events} ->
+        Logger.info("[TimeDecay] Discovery found #{length(events)} events")
+
         # Extract all token IDs from discovered markets
         all_tokens =
           events
@@ -223,9 +231,10 @@ defmodule Polyx.Strategies.TimeDecay do
           end)
           |> MapSet.new()
 
+        Logger.info("[TimeDecay] Discovery found #{MapSet.size(all_tokens)} tokens")
+
         # Find newly discovered tokens
         new_tokens = MapSet.difference(all_tokens, state.discovered_tokens)
-
 
         # Update discovered tokens
         state = %{state | discovered_tokens: MapSet.union(state.discovered_tokens, new_tokens)}

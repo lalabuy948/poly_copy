@@ -14,14 +14,10 @@ defmodule Polyx.Strategies.Runner do
   alias Polyx.Polymarket.LiveOrders
 
   @tick_interval 5_000
-  # Reduced for more responsive price updates in UI
-  @broadcast_throttle_ms 100
-  @ets_table :strategy_discovered_tokens
-  # Refresh prices from Gamma API every 10 seconds as fallback
-  # WebSocket provides real-time updates (primary source)
-  @price_refresh_interval 10_000
-  # Threshold for prioritizing WebSocket subscriptions (15 minutes)
-  @priority_resolution_minutes 15
+  # Minimal throttle - let LiveView handle batching for better responsiveness
+  @broadcast_throttle_ms 250
+  # Discovery interval - check for new/expired markets every 2 minutes
+  @discovery_interval 120_000
 
   defstruct [
     :strategy_id,
@@ -29,13 +25,13 @@ defmodule Polyx.Strategies.Runner do
     :module,
     :state,
     :tick_ref,
-    :price_refresh_ref,
+    :discovery_ref,
     :target_tokens,
     :last_broadcast,
-    # Tokens with active WebSocket subscriptions (get real-time updates)
-    websocket_subscribed: MapSet.new(),
-    # Token resolution times for prioritization
-    token_resolution_times: %{},
+    # Tokens we're tracking - map of token_id => market_info
+    discovered_tokens: %{},
+    # Cached prices from WebSocket - map of token_id => price_data
+    token_prices: %{},
     paused: false
   ]
 
@@ -61,38 +57,29 @@ defmodule Polyx.Strategies.Runner do
   end
 
   @doc """
-  Get discovered tokens from a running strategy.
-  Returns {:ok, list} - reads from ETS for non-blocking access.
+  Get discovered token IDs from a running strategy.
+  Returns {:ok, list_of_token_ids}.
   """
   def get_discovered_tokens(strategy_id) do
-    ensure_ets_table()
-
-    case :ets.lookup(@ets_table, strategy_id) do
-      [{^strategy_id, tokens}] -> {:ok, tokens}
-      [] -> {:ok, []}
+    try do
+      tokens = GenServer.call(via_tuple(strategy_id), :get_discovered_tokens, 5_000)
+      {:ok, tokens}
+    catch
+      :exit, _ -> {:ok, []}
     end
   end
 
-  # Ensure ETS table exists (creates if not)
-  defp ensure_ets_table do
-    case :ets.whereis(@ets_table) do
-      :undefined ->
-        # Handle race condition - another process may have created it between check and create
-        try do
-          :ets.new(@ets_table, [:named_table, :public, :set])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ ->
-        :ok
+  @doc """
+  Get discovered tokens with market info from a running strategy.
+  Returns {:ok, map} where map is %{token_id => %{market_question: ..., end_date: ..., ...}}.
+  """
+  def get_discovered_tokens_with_info(strategy_id) do
+    try do
+      tokens = GenServer.call(via_tuple(strategy_id), :get_discovered_tokens_with_info, 5_000)
+      {:ok, tokens}
+    catch
+      :exit, _ -> {:ok, %{}}
     end
-  end
-
-  # Store discovered tokens in ETS for fast non-blocking reads
-  defp store_discovered_tokens(strategy_id, tokens) when is_list(tokens) do
-    ensure_ets_table()
-    :ets.insert(@ets_table, {strategy_id, tokens})
   end
 
   def pause(strategy_id) do
@@ -117,7 +104,10 @@ defmodule Polyx.Strategies.Runner do
       {:ok, module} ->
         # Convert raw config to full strategy config with timeframe defaults
         full_config = convert_config(strategy.config)
-        Logger.info("[Runner] Module: #{module}, timeframe: #{full_config["market_timeframe"]}, max_minutes: #{full_config["max_minutes_to_resolution"]}")
+
+        Logger.info(
+          "[Runner] Module: #{module}, timeframe: #{full_config["market_timeframe"]}, max_minutes: #{full_config["max_minutes_to_resolution"]}"
+        )
 
         case module.init(full_config) do
           {:ok, strategy_state} ->
@@ -131,20 +121,10 @@ defmodule Polyx.Strategies.Runner do
             # Extract target tokens from config (list of token IDs to watch)
             target_tokens = extract_target_tokens(strategy.config)
 
-            target_count =
-              if target_tokens == :all, do: "all markets", else: "#{length(target_tokens)} tokens"
+            Strategies.log_event(strategy, "info", "Strategy started (#{mode} mode)")
 
-            Strategies.log_event(
-              strategy,
-              "info",
-              "Strategy started (#{mode} mode, watching #{target_count})"
-            )
-
-            # Schedule periodic tick
+            # Schedule periodic tick for signal processing
             tick_ref = Process.send_after(self(), :tick, @tick_interval)
-            # Schedule periodic price refresh from API
-            price_refresh_ref =
-              Process.send_after(self(), :refresh_prices, @price_refresh_interval)
 
             state = %__MODULE__{
               strategy_id: strategy_id,
@@ -152,20 +132,16 @@ defmodule Polyx.Strategies.Runner do
               module: module,
               state: strategy_state,
               tick_ref: tick_ref,
-              price_refresh_ref: price_refresh_ref,
+              discovery_ref: nil,
               target_tokens: target_tokens,
-              last_broadcast: 0
+              last_broadcast: 0,
+              discovered_tokens: %{}
             }
 
-            # Schedule initial discovery async if needed (don't block init)
-            needs_discovery = Map.get(strategy_state, :needs_initial_discovery, false)
-            if needs_discovery do
-              send(self(), :initial_discovery)
-            end
+            # Run initial discovery immediately (don't block init)
+            send(self(), :discover)
 
-            Logger.info(
-              "[Runner] Started strategy #{strategy.name} (#{strategy.type}, #{mode}, #{target_count})"
-            )
+            Logger.info("[Runner] Started strategy #{strategy.name} (#{strategy.type}, #{mode})")
 
             {:ok, state}
         end
@@ -204,45 +180,46 @@ defmodule Polyx.Strategies.Runner do
   end
 
   @impl true
+  def handle_call(:get_discovered_tokens, _from, state) do
+    # Return tokens directly from Runner state
+    {:reply, Map.keys(state.discovered_tokens), state}
+  end
+
+  @impl true
+  def handle_call(:get_discovered_tokens_with_info, _from, state) do
+    # Return full token info merged with cached prices for UI
+    tokens_with_prices =
+      Enum.reduce(state.discovered_tokens, %{}, fn {token_id, info}, acc ->
+        cached_price = Map.get(state.token_prices, token_id, %{})
+
+        merged = %{
+          market_question: info[:market_question] || cached_price[:market_question],
+          event_title: info[:event_title],
+          outcome: info[:outcome] || cached_price[:outcome],
+          end_date: info[:end_date],
+          best_bid: cached_price[:best_bid],
+          best_ask: cached_price[:best_ask],
+          updated_at: info[:updated_at]
+        }
+
+        Map.put(acc, token_id, merged)
+      end)
+
+    {:reply, tokens_with_prices, state}
+  end
+
+  @impl true
   def handle_info({:new_order, order}, state) do
-    # Only process if strategy is not paused (use cached state, not DB)
     if not state.paused do
-      # Check if this order matches our target tokens (filter)
       asset_id = order[:asset_id] || order["asset_id"]
 
-      # Check if auto-discovery mode is enabled and token is in discovered list
-      # Use strategy state config (merged with hardcoded defaults) instead of DB config
-      strategy_config = Map.get(state.state, :config, %{})
-      auto_discover = strategy_config["auto_discover_crypto"] == true
-      discovered_tokens = extract_discovered_tokens(state.state)
-      is_discovered = auto_discover and MapSet.member?(discovered_tokens, asset_id)
+      # Check if this token is in our discovered list (simple map key check)
+      is_discovered = Map.has_key?(state.discovered_tokens, asset_id)
 
-      cond do
-        # Configured tokens - process through strategy
-        should_process_order?(state.target_tokens, asset_id) ->
-          process_order(order, state)
-
-        # Auto-discovered crypto tokens - process through strategy
-        is_discovered ->
-          process_order(order, state)
-
-        # No tokens configured but watch_all is set - broadcast all orders
-        state.target_tokens == :all ->
-          process_order(order, state)
-
-        # No tokens configured and auto-discover disabled - broadcast for visibility
-        state.target_tokens == [] and not auto_discover ->
-          now = System.system_time(:millisecond)
-          # Heavier throttle (500ms) for unfiltered orders
-          if now - state.last_broadcast >= 500 do
-            broadcast_live_order(state.strategy_id, order, nil)
-            {:noreply, %{state | last_broadcast: now}}
-          else
-            {:noreply, state}
-          end
-
-        true ->
-          {:noreply, state}
+      if is_discovered do
+        process_order(order, state)
+      else
+        {:noreply, state}
       end
     else
       {:noreply, state}
@@ -257,44 +234,33 @@ defmodule Polyx.Strategies.Runner do
   end
 
   @impl true
-  def handle_info(:initial_discovery, state) do
+  def handle_info(:discover, state) do
+    Logger.info("[Runner] Running discovery for strategy #{state.strategy_id}")
 
-    # Call discover function if the module supports it
     new_state =
       if function_exported?(state.module, :discover_crypto_markets, 1) do
         case state.module.discover_crypto_markets(state.state) do
-          {:ok, new_strategy_state, _signals} ->
-            updated_runner_state =
-              subscribe_to_discovered(state.strategy_id, new_strategy_state, state)
-
-            %{
-              updated_runner_state
-              | state: %{new_strategy_state | needs_initial_discovery: false}
-            }
-
           {:ok, new_strategy_state} ->
-            updated_runner_state =
-              subscribe_to_discovered(state.strategy_id, new_strategy_state, state)
+            sync_discovered_tokens(state, new_strategy_state)
 
-            %{
-              updated_runner_state
-              | state: %{new_strategy_state | needs_initial_discovery: false}
-            }
+          {:ok, new_strategy_state, _signals} ->
+            sync_discovered_tokens(state, new_strategy_state)
 
-          _ ->
+          other ->
+            Logger.error("[Runner] Discovery failed: #{inspect(other)}")
             state
         end
       else
         state
       end
 
-    {:noreply, new_state}
+    # Schedule next discovery in 2 minutes
+    discovery_ref = Process.send_after(self(), :discover, @discovery_interval)
+    {:noreply, %{new_state | discovery_ref: discovery_ref}}
   end
 
   @impl true
   def handle_info(:tick, state) do
-    old_discovered = extract_discovered_tokens(state.state)
-
     new_state =
       if not state.paused do
         case state.module.handle_tick(state.state) do
@@ -309,96 +275,25 @@ defmodule Polyx.Strategies.Runner do
         state
       end
 
-    # Handle removed tokens (resolved markets)
-    removed_tokens = Map.get(new_state.state, :removed_tokens, [])
-
-    new_state =
-      if removed_tokens != [] do
-        # Update ETS with cleaned token list
-        current_discovered = extract_discovered_tokens(new_state.state)
-        store_discovered_tokens(state.strategy_id, MapSet.to_list(current_discovered))
-        # Broadcast removal to UI
-        broadcast_removed_tokens(state.strategy_id, removed_tokens)
-        # Unsubscribe from LiveOrders ETS to prevent memory leak
-        LiveOrders.unsubscribe_from_markets(removed_tokens)
-        # Clear removed_tokens from state to avoid re-broadcasting
-        cleaned_strategy_state = Map.put(new_state.state, :removed_tokens, [])
-        # Also remove from WebSocket subscribed set and resolution times
-        removed_set = MapSet.new(removed_tokens)
-
-        %{
-          new_state
-          | state: cleaned_strategy_state,
-            websocket_subscribed: MapSet.difference(new_state.websocket_subscribed, removed_set),
-            token_resolution_times: Map.drop(new_state.token_resolution_times, removed_tokens)
-        }
-      else
-        new_state
-      end
-
-    # Broadcast newly discovered tokens to UI and subscribe to WebSocket
-    new_discovered = extract_discovered_tokens(new_state.state)
-
-    new_state =
-      if MapSet.size(new_discovered) > MapSet.size(old_discovered) do
-        new_tokens = MapSet.difference(new_discovered, old_discovered)
-
-        if MapSet.size(new_tokens) > 0 do
-          new_token_list = MapSet.to_list(new_tokens)
-          # Update ETS with ALL discovered tokens for fast reads
-          all_tokens = MapSet.to_list(new_discovered)
-          store_discovered_tokens(state.strategy_id, all_tokens)
-          broadcast_discovered_tokens(state.strategy_id, new_token_list)
-
-          # Get resolution times for tracking
-          {_priority_tokens, resolution_times} =
-            get_priority_tokens_for_subscription(new_state.state)
-
-          # Subscribe ALL new tokens to WebSocket
-          LiveOrders.subscribe_to_markets(new_token_list)
-
-          %{
-            new_state
-            | websocket_subscribed: MapSet.union(new_state.websocket_subscribed, new_tokens),
-              token_resolution_times:
-                Map.merge(new_state.token_resolution_times, resolution_times)
-          }
-        else
-          new_state
-        end
-      else
-        new_state
-      end
-
     # Schedule next tick
     tick_ref = Process.send_after(self(), :tick, @tick_interval)
     {:noreply, %{new_state | tick_ref: tick_ref}}
   end
 
   @impl true
-  def handle_info(:refresh_prices, state) do
-    # WebSocket is the only source of prices - no API polling
-    price_refresh_ref = Process.send_after(self(), :refresh_prices, @price_refresh_interval)
-    {:noreply, %{state | price_refresh_ref: price_refresh_ref}}
-  end
-
-  @impl true
   def handle_info({:new_orders_batch, _orders}, state) do
-    # Ignore batch messages - we process individual {:new_order, order} messages instead
-    # LiveOrders broadcasts both batch AND individual messages for compatibility
     {:noreply, state}
   end
 
   @impl true
   def handle_info(_msg, state) do
-    # Ignore unknown messages
     {:noreply, state}
   end
 
   @impl true
   def terminate(reason, state) do
     if state.tick_ref, do: Process.cancel_timer(state.tick_ref)
-    if state.price_refresh_ref, do: Process.cancel_timer(state.price_refresh_ref)
+    if state.discovery_ref, do: Process.cancel_timer(state.discovery_ref)
 
     case reason do
       :normal ->
@@ -415,86 +310,81 @@ defmodule Polyx.Strategies.Runner do
 
   # Private functions
 
-  # Subscribe ALL discovered tokens to WebSocket - single source of truth for prices
-  defp subscribe_to_discovered(strategy_id, strategy_state, runner_state) do
-    discovered = extract_discovered_tokens(strategy_state)
-
-    if MapSet.size(discovered) > 0 do
-      token_list = MapSet.to_list(discovered)
-      store_discovered_tokens(strategy_id, token_list)
-      broadcast_discovered_tokens(strategy_id, token_list)
-
-      # Get resolution times for tracking
-      {_priority_tokens, resolution_times} = get_priority_tokens_for_subscription(strategy_state)
-
-      LiveOrders.subscribe_to_markets(token_list)
-
-      # Schedule immediate price refresh to seed initial prices
-      # (WebSocket may not have activity on quiet markets)
-      Process.send_after(self(), :refresh_prices, 500)
-
-      %{
-        runner_state
-        | websocket_subscribed: MapSet.new(token_list),
-          token_resolution_times: resolution_times
-      }
-    else
-      runner_state
-    end
-  end
-
-  # Subscribe to priority tokens (those resolving within @priority_resolution_minutes)
-  # Returns {tokens_to_subscribe, resolution_times_map}
-  defp get_priority_tokens_for_subscription(strategy_state) do
+  # Sync Runner's discovered_tokens with strategy state
+  # Handles: new tokens (add + subscribe), expired tokens (remove + unsubscribe), same tokens (no-op)
+  defp sync_discovered_tokens(runner_state, strategy_state) do
+    strategy_id = runner_state.strategy_id
     market_cache = Map.get(strategy_state, :market_cache, %{})
-    discovered = extract_discovered_tokens(strategy_state)
-    now = DateTime.utc_now()
 
-    discovered
-    |> MapSet.to_list()
-    |> Enum.reduce({[], %{}}, fn token_id, {priority_tokens, times} ->
-      case Map.get(market_cache, token_id) do
-        %{end_date: end_date} when not is_nil(end_date) ->
-          case parse_end_date_for_runner(end_date) do
-            {:ok, end_dt} ->
-              minutes = DateTime.diff(end_dt, now, :second) / 60
+    # Get token IDs from strategy's discovered_tokens MapSet
+    new_token_ids =
+      case Map.get(strategy_state, :discovered_tokens) do
+        %MapSet{} = set -> MapSet.to_list(set)
+        _ -> []
+      end
 
-              if minutes > 0 and minutes <= @priority_resolution_minutes do
-                # Priority token - subscribe via WebSocket
-                {[token_id | priority_tokens], Map.put(times, token_id, minutes)}
-              else
-                # Non-priority - just track resolution time
-                {priority_tokens, Map.put(times, token_id, minutes)}
-              end
+    current_token_ids = Map.keys(runner_state.discovered_tokens)
 
-            _ ->
-              {priority_tokens, times}
+    # Find what changed
+    new_set = MapSet.new(new_token_ids)
+    current_set = MapSet.new(current_token_ids)
+    added = MapSet.difference(new_set, current_set) |> MapSet.to_list()
+    removed = MapSet.difference(current_set, new_set) |> MapSet.to_list()
+
+    # Build new discovered_tokens map with market info
+    new_discovered_tokens =
+      Enum.reduce(new_token_ids, %{}, fn token_id, acc ->
+        info =
+          case Map.get(market_cache, token_id) do
+            nil ->
+              %{updated_at: System.system_time(:millisecond)}
+
+            market_info ->
+              %{
+                market_question: market_info[:question],
+                event_title: market_info[:event_title],
+                outcome: market_info[:outcome],
+                end_date: market_info[:end_date],
+                updated_at: System.system_time(:millisecond)
+              }
           end
 
-        _ ->
-          {priority_tokens, times}
-      end
-    end)
-  end
+        Map.put(acc, token_id, info)
+      end)
 
-  defp parse_end_date_for_runner(end_date) when is_binary(end_date) do
-    case DateTime.from_iso8601(end_date) do
-      {:ok, dt, _offset} ->
-        {:ok, dt}
+    # Handle added tokens
+    if added != [] do
+      Logger.info("[Runner] Discovered #{length(added)} new tokens, subscribing to WebSocket")
+      LiveOrders.subscribe_to_markets(added)
 
-      {:error, _} ->
-        case Integer.parse(end_date) do
-          {ts, _} -> {:ok, DateTime.from_unix!(ts)}
-          :error -> {:error, :invalid_format}
-        end
+      # Broadcast new tokens to UI
+      tokens_with_info =
+        Enum.map(added, fn token_id -> {token_id, new_discovered_tokens[token_id]} end)
+
+      Phoenix.PubSub.broadcast(
+        Polyx.PubSub,
+        "strategies:#{strategy_id}",
+        {:discovered_tokens, tokens_with_info}
+      )
     end
-  end
 
-  defp parse_end_date_for_runner(end_date) when is_integer(end_date) do
-    {:ok, DateTime.from_unix!(end_date)}
-  end
+    # Handle removed tokens
+    if removed != [] do
+      Logger.info("[Runner] Removing #{length(removed)} expired tokens: #{inspect(removed)}")
+      LiveOrders.unsubscribe_from_markets(removed)
 
-  defp parse_end_date_for_runner(_), do: {:error, :invalid_format}
+      Phoenix.PubSub.broadcast(
+        Polyx.PubSub,
+        "strategies:#{strategy_id}",
+        {:removed_tokens, removed}
+      )
+    end
+
+    # Log current state
+    Logger.info("[Runner] Token sync complete: #{length(new_token_ids)} active tokens")
+
+    %{runner_state | state: strategy_state, discovered_tokens: new_discovered_tokens}
+  end
 
   defp execute_signals(strategy, signals) do
     # Use cached strategy from state - paper_mode is updated via toggle_paper_mode event
@@ -734,22 +624,6 @@ defmodule Polyx.Strategies.Runner do
     )
   end
 
-  defp broadcast_discovered_tokens(strategy_id, token_ids) do
-    Phoenix.PubSub.broadcast(
-      Polyx.PubSub,
-      "strategies:#{strategy_id}",
-      {:discovered_tokens, token_ids}
-    )
-  end
-
-  defp broadcast_removed_tokens(strategy_id, token_ids) do
-    Phoenix.PubSub.broadcast(
-      Polyx.PubSub,
-      "strategies:#{strategy_id}",
-      {:removed_tokens, token_ids}
-    )
-  end
-
   defp update_position(strategy, signal) do
     # Update or create position for this token
     existing = Strategies.get_position(strategy.id, signal.token_id)
@@ -814,66 +688,45 @@ defmodule Polyx.Strategies.Runner do
     end
   end
 
-  # Check if order should be processed based on target tokens
-  # Uses exact matching only to avoid accidentally matching unrelated tokens
-  defp should_process_order?(:all, _asset_id), do: true
-  defp should_process_order?([], _asset_id), do: false
-  defp should_process_order?(_target_tokens, nil), do: false
-
-  defp should_process_order?(target_tokens, asset_id) when is_list(target_tokens) do
-    # Exact match only - token IDs should be complete identifiers
-    asset_id in target_tokens
-  end
-
-  # Extract discovered tokens from strategy state (for auto-discovery mode)
-  defp extract_discovered_tokens(%{discovered_tokens: tokens}) when is_struct(tokens, MapSet) do
-    tokens
-  end
-
-  defp extract_discovered_tokens(_), do: MapSet.new()
-
   # Process order through strategy with throttled UI broadcast
   defp process_order(order, state) do
     now = System.system_time(:millisecond)
-
-    # Throttle UI broadcasts to avoid flooding
     should_broadcast = now - state.last_broadcast >= @broadcast_throttle_ms
-
-    # Always broadcast price updates for tracked tokens (less throttled)
     asset_id = order[:asset_id] || order["asset_id"]
 
-    # Only broadcast if token is still in discovered set (not resolved)
-    discovered_tokens = extract_discovered_tokens(state.state)
-    is_active = MapSet.member?(discovered_tokens, asset_id)
+    # Extract price from order - can come from best_bid/best_ask (price_change/book events)
+    # or from price field (last_trade_price events)
+    best_bid = order[:best_bid] || order["best_bid"]
+    best_ask = order[:best_ask] || order["best_ask"]
+    trade_price = order[:price] || order["price"]
 
-    # Track if we broadcasted to update last_broadcast time
+    # Use trade price as fallback for bid/ask if not present
+    effective_bid = best_bid || trade_price
+    effective_ask = best_ask || trade_price
+
+    # Always cache prices in state (for new UI subscribers)
+    state =
+      if asset_id && (effective_bid || effective_ask) do
+        price_data = %{
+          best_bid: effective_bid,
+          best_ask: effective_ask,
+          outcome: order[:outcome] || order["outcome"],
+          market_question: order[:market_question] || order["market_question"],
+          updated_at: now
+        }
+
+        updated_prices = Map.put(state.token_prices, asset_id, price_data)
+        %{state | token_prices: updated_prices}
+      else
+        state
+      end
+
+    # Broadcast price update if token is active (throttled)
     did_broadcast =
-      if asset_id && should_broadcast && is_active do
-        # Extract price from order - can come from best_bid/best_ask (price_change/book events)
-        # or from price field (last_trade_price events)
-        best_bid = order[:best_bid] || order["best_bid"]
-        best_ask = order[:best_ask] || order["best_ask"]
-        trade_price = order[:price] || order["price"]
-
-        # Use trade price as fallback for bid/ask if not present
-        effective_bid = best_bid || trade_price
-        effective_ask = best_ask || trade_price
-
-        # Only broadcast if we have some price data
-        if effective_bid || effective_ask do
-          price_data = %{
-            best_bid: effective_bid,
-            best_ask: effective_ask,
-            outcome: order[:outcome] || order["outcome"],
-            market_question: order[:market_question] || order["market_question"],
-            updated_at: now
-          }
-
-          broadcast_price_update(state.strategy_id, asset_id, price_data)
-          true
-        else
-          false
-        end
+      if asset_id && should_broadcast && (effective_bid || effective_ask) do
+        price_data = Map.get(state.token_prices, asset_id)
+        broadcast_price_update(state.strategy_id, asset_id, price_data)
+        true
       else
         false
       end
