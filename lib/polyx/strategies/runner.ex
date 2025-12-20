@@ -138,6 +138,8 @@ defmodule Polyx.Strategies.Runner do
               discovered_tokens: %{}
             }
 
+            state = prime_target_tokens(state)
+
             # Run initial discovery immediately (don't block init)
             send(self(), :discover)
 
@@ -322,6 +324,9 @@ defmodule Polyx.Strategies.Runner do
         %MapSet{} = set -> MapSet.to_list(set)
         _ -> []
       end
+      |> MapSet.new()
+      |> MapSet.union(MapSet.new(target_token_list(runner_state)))
+      |> MapSet.to_list()
 
     current_token_ids = Map.keys(runner_state.discovered_tokens)
 
@@ -394,6 +399,32 @@ defmodule Polyx.Strategies.Runner do
     Logger.info("[Runner] Token sync complete: #{length(new_token_ids)} active tokens")
 
     %{runner_state | state: strategy_state, discovered_tokens: new_discovered_tokens}
+  end
+
+  defp prime_target_tokens(%__MODULE__{} = state) do
+    tokens = target_token_list(state)
+
+    if tokens == [] do
+      state
+    else
+      Logger.info("[Runner] Subscribing to #{length(tokens)} configured target tokens")
+      LiveOrders.subscribe_to_markets(tokens)
+
+      discovered =
+        Enum.reduce(tokens, state.discovered_tokens, fn token_id, acc ->
+          Map.put_new(acc, token_id, %{updated_at: System.system_time(:millisecond)})
+        end)
+
+      %{state | discovered_tokens: discovered}
+    end
+  end
+
+  defp target_token_list(%__MODULE__{} = state) do
+    case state.target_tokens do
+      :all -> []
+      list when is_list(list) -> Enum.filter(list, &is_binary/1)
+      _ -> []
+    end
   end
 
   defp execute_signals(strategy, signals) do

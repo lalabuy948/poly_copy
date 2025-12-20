@@ -7,6 +7,7 @@ defmodule PolyxWeb.Components.Strategies.StrategyList do
   import PolyxWeb.StrategiesLive.{Formatters, Helpers}
 
   alias Polyx.Strategies.Behaviour
+  alias Polyx.Strategies.Engine
 
   @doc """
   Renders the strategies list with new strategy form.
@@ -122,6 +123,7 @@ defmodule PolyxWeb.Components.Strategies.StrategyList do
               </div>
             </div>
             <div class="flex items-center gap-2">
+              <% running? = strategy.status == "running" or Engine.running?(strategy.id) %>
               <span
                 :if={strategy.paper_mode}
                 class="px-2 py-0.5 rounded text-xs font-medium bg-warning/10 text-warning"
@@ -146,14 +148,14 @@ defmodule PolyxWeb.Components.Strategies.StrategyList do
                 phx-value-id={strategy.id}
                 class={[
                   "relative inline-flex h-6 w-10 items-center rounded-full transition-colors",
-                  strategy.status == "running" && "bg-success",
-                  strategy.status != "running" && "bg-base-300"
+                  running? && "bg-success",
+                  !running? && "bg-base-300"
                 ]}
               >
                 <span class={[
                   "inline-block h-4 w-4 transform rounded-full bg-white transition-transform shadow-sm",
-                  strategy.status == "running" && "translate-x-5",
-                  strategy.status != "running" && "translate-x-1"
+                  running? && "translate-x-5",
+                  !running? && "translate-x-1"
                 ]} />
               </button>
               <button

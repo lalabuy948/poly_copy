@@ -42,7 +42,8 @@ defmodule Polyx.Strategies.TimeDecay do
           "max_minutes_to_resolution" => 60,
           "cooldown_seconds" => 60,
           "min_profit" => 0.01,
-          "discovery_interval_seconds" => 30,
+          # Enforce at least 2 minutes between crypto discoveries
+          "discovery_interval_seconds" => 120,
           "scan_enabled" => false
         },
         config
@@ -142,7 +143,14 @@ defmodule Polyx.Strategies.TimeDecay do
 
     # Auto-discovery
     auto_discover = config["auto_discover_crypto"] == true
-    discovery_interval = config["discovery_interval_seconds"] || 120
+
+    discovery_interval =
+      config["discovery_interval_seconds"]
+      |> case do
+        nil -> 120
+        val when val < 120 -> 120
+        val -> val
+      end
 
     state =
       if auto_discover and now - state.last_crypto_discovery >= discovery_interval do
@@ -326,20 +334,32 @@ defmodule Polyx.Strategies.TimeDecay do
     min_profit = config["min_profit"] || 0.01
     crypto_only = config["crypto_only"] != false
 
-    # Check cooldown or already placed
-    already_placed = Map.has_key?(state.placed_orders, asset_id)
+    # Get market info early to check opposite token cooldown
+    {_outcome, market_info, state} = get_token_info(state, asset_id)
+    opposite_token_id = market_info[:opposite_token_id]
 
-    if already_placed or in_cooldown?(state, asset_id) do
+    # Check cooldown or already placed (for both this token and opposite)
+    already_placed = Map.has_key?(state.placed_orders, asset_id)
+    this_in_cooldown = in_cooldown?(state, asset_id)
+    opposite_in_cooldown = opposite_token_id && in_cooldown?(state, opposite_token_id)
+
+    if already_placed or this_in_cooldown or opposite_in_cooldown do
       :no_opportunity
     else
       # Calculate price
       current_price = Helpers.calculate_evaluation_price(best_bid, best_ask, true)
       _spread = Helpers.calculate_spread(best_bid, best_ask)
 
-      # Get market info
-      {_outcome, market_info, state} = get_token_info(state, asset_id)
+      # CRITICAL SAFETY CHECK: Prevent trading on invalid/missing prices
+      cond do
+        is_nil(best_bid) and is_nil(best_ask) -> :no_opportunity
+        is_nil(current_price) -> :no_opportunity
+        current_price < 0.05 -> :no_opportunity
+        best_ask && best_ask < 0.05 -> :no_opportunity
+        true -> nil
+      end
 
-      # Check filters
+      # Check filters (market_info already fetched above)
       is_crypto = Helpers.is_crypto_market?(market_info)
       minutes_to_resolution = Helpers.calculate_minutes_to_resolution(market_info[:end_date])
 
@@ -353,7 +373,7 @@ defmodule Polyx.Strategies.TimeDecay do
         end
 
       cond do
-        is_nil(current_price) ->
+        is_nil(current_price) or current_price < 0.05 or (best_ask && best_ask < 0.05) ->
           :no_opportunity
 
         crypto_only and not is_crypto ->

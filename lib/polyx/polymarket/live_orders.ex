@@ -27,7 +27,11 @@ defmodule Polyx.Polymarket.LiveOrders do
                ws_ready: false,
                order_batch: [],
                batch_timer: nil,
-               subscribed_markets: MapSet.new()
+               subscribed_markets: MapSet.new(),
+               subscription_retry: %{},
+               subscription_stats: %{attempts: 0, retries: 0},
+               last_message_at: nil,
+               health_timer: nil
              },
              opts: [
                name: {:local, __MODULE__},
@@ -69,6 +73,11 @@ defmodule Polyx.Polymarket.LiveOrders do
   @impl Fresh
   def handle_connect(_status, _headers, state) do
     Logger.info("[LiveOrders] Connected to Polymarket WebSocket")
+
+    Logger.info(
+      "[LiveOrders] Subscription stats so far: attempts=#{state.subscription_stats.attempts}, retries=#{state.subscription_stats.retries}"
+    )
+
     broadcast({:connected, true})
 
     # Re-subscribe to all markets after reconnect
@@ -79,7 +88,17 @@ defmodule Polyx.Polymarket.LiveOrders do
       send(self(), {:send_subscriptions, markets})
     end
 
-    {:ok, %{state | ws_ready: true, order_batch: [], batch_timer: nil}}
+    health_timer = Process.send_after(self(), :check_health, 10_000)
+
+    {:ok,
+     %{
+       state
+       | ws_ready: true,
+         order_batch: [],
+         batch_timer: nil,
+         last_message_at: System.system_time(:millisecond),
+         health_timer: health_timer
+     }}
   end
 
   @impl Fresh
@@ -87,7 +106,9 @@ defmodule Polyx.Polymarket.LiveOrders do
     Logger.warning("[LiveOrders] Disconnected, reconnecting...")
     broadcast({:connected, false})
     if state.batch_timer, do: Process.cancel_timer(state.batch_timer)
-    {:reconnect, %{state | ws_ready: false, order_batch: [], batch_timer: nil}}
+    if state.health_timer, do: Process.cancel_timer(state.health_timer)
+
+    {:reconnect, %{state | ws_ready: false, order_batch: [], batch_timer: nil, health_timer: nil}}
   end
 
   @impl Fresh
@@ -99,20 +120,38 @@ defmodule Polyx.Polymarket.LiveOrders do
 
   @impl Fresh
   def handle_in({:text, message}, state) do
-    state =
-      case Jason.decode(message) do
-        {:ok, %{"event_type" => event_type} = data} ->
-          # Logger.debug("[LiveOrders] Event: #{event_type}")
-          handle_event(event_type, data, state)
+    now = System.system_time(:millisecond)
+    st = %{state | last_message_at: now}
 
-        {:ok, data} when is_list(data) ->
-          Enum.reduce(data, state, fn item, acc ->
-            event_type = Map.get(item, "event_type", "unknown")
-            handle_event(event_type, item, acc)
-          end)
+    state =
+      case message do
+        "NO NEW ASSETS" ->
+          Logger.info("[LiveOrders] Server responded: NO NEW ASSETS (already subscribed)")
+          st
+
+        "INVALID OPERATION" ->
+          Logger.error("[LiveOrders] Server responded: INVALID OPERATION")
+          st
 
         _ ->
-          state
+          case Jason.decode(message) do
+            {:ok, %{"event_type" => event_type} = data} ->
+              handle_event(event_type, data, st)
+
+            {:ok, data} when is_list(data) ->
+              Enum.reduce(data, st, fn item, acc ->
+                event_type = Map.get(item, "event_type", "unknown")
+                handle_event(event_type, item, acc)
+              end)
+
+            {:ok, other} ->
+              Logger.warning("[LiveOrders] Unknown message without event_type: #{inspect(other)}")
+              st
+
+            {:error, decode_error} ->
+              Logger.error("[LiveOrders] Failed to decode message: #{inspect(decode_error)}")
+              st
+          end
       end
 
     {:ok, state}
@@ -144,18 +183,82 @@ defmodule Polyx.Polymarket.LiveOrders do
   end
 
   def handle_info({:send_subscriptions, asset_ids}, state) do
-    if state.ws_ready and asset_ids != [] do
-      msg = Jason.encode!(%{assets_ids: asset_ids, type: "market"})
-      Logger.info("[LiveOrders] Subscribing to #{length(asset_ids)} markets")
-      Logger.debug("[LiveOrders] Subscription message: #{msg}")
-      Fresh.send(__MODULE__, {:text, msg})
-    else
-      if not state.ws_ready do
-        Logger.warning("[LiveOrders] Cannot subscribe - WebSocket not ready")
+    asset_ids = normalize_asset_ids(asset_ids, state)
+
+    cond do
+      asset_ids == [] ->
+        {:ok, state}
+
+      state.ws_ready ->
+        {state, sent?} = send_subscriptions_now(asset_ids, state)
+
+        if sent? do
+          schedule_retry(asset_ids, 1)
+        end
+
+        {:ok, state}
+
+      true ->
+        Logger.warning("[LiveOrders] Cannot subscribe - WebSocket not ready, will retry")
+        Process.send_after(self(), {:send_subscriptions, asset_ids}, 2_000)
+        {:ok, state}
+    end
+  end
+
+  def handle_info({:retry_subscriptions, asset_ids, attempt}, state) do
+    asset_ids = normalize_asset_ids(asset_ids, state)
+
+    cond do
+      asset_ids == [] ->
+        {:ok, state}
+
+      state.ws_ready ->
+        {state, sent?} = send_subscriptions_now(asset_ids, state)
+
+        state =
+          if sent? do
+            stats =
+              state.subscription_stats
+              |> Map.update(:retries, 1, &(&1 + 1))
+
+            # keep retrying, but cap delay growth
+            schedule_retry(asset_ids, min(attempt + 1, 10))
+            %{state | subscription_stats: stats}
+          else
+            state
+          end
+
+        {:ok, state}
+
+      true ->
+        Logger.warning(
+          "[LiveOrders] WebSocket not ready (retry #{attempt}) - rescheduling subscriptions"
+        )
+
+        Process.send_after(self(), {:retry_subscriptions, asset_ids, attempt + 1}, 2_000)
+        {:ok, state}
+    end
+  end
+
+  def handle_info(:check_health, state) do
+    now = System.system_time(:millisecond)
+    last = state.last_message_at || now
+    age = now - last
+
+    if age > 15_000 do
+      markets = MapSet.to_list(state.subscribed_markets)
+
+      if markets != [] do
+        Logger.warning(
+          "[LiveOrders] No messages for #{div(age, 1000)}s; re-subscribing to #{length(markets)} markets"
+        )
+
+        send(self(), {:send_subscriptions, markets})
       end
     end
 
-    {:ok, state}
+    health_timer = Process.send_after(self(), :check_health, 10_000)
+    {:ok, %{state | health_timer: health_timer}}
   end
 
   def handle_info(_msg, state), do: {:ok, state}
@@ -165,21 +268,26 @@ defmodule Polyx.Polymarket.LiveOrders do
   defp handle_event("last_trade_price", data, state) do
     asset_id = data["asset_id"]
     market_info = lookup_market_info(asset_id)
+    price = parse_float(data["price"])
 
-    order = %{
-      id: System.unique_integer([:positive, :monotonic]),
-      event_type: "trade",
-      asset_id: asset_id,
-      price: parse_float(data["price"]),
-      size: parse_float(data["size"]),
-      side: data["side"],
-      timestamp: data["timestamp"] || System.system_time(:millisecond),
-      market_question: market_info[:question],
-      event_title: market_info[:event_title],
-      outcome: market_info[:outcome]
-    }
+    if asset_id && price do
+      order = %{
+        id: System.unique_integer([:positive, :monotonic]),
+        event_type: "trade",
+        asset_id: asset_id,
+        price: price,
+        size: parse_float(data["size"]),
+        side: data["side"],
+        timestamp: data["timestamp"] || System.system_time(:millisecond),
+        market_question: market_info[:question],
+        event_title: market_info[:event_title],
+        outcome: market_info[:outcome]
+      }
 
-    add_to_batch(order, state)
+      add_to_batch(order, state)
+    else
+      state
+    end
   end
 
   defp handle_event("price_change", data, state) do
@@ -195,6 +303,8 @@ defmodule Polyx.Polymarket.LiveOrders do
 
       best_bid = parse_float(change["best_bid"])
       best_ask = parse_float(change["best_ask"])
+      price = parse_float(change["price"])
+      size = parse_float(change["size"])
 
       # if best_bid || best_ask do
       #   Logger.debug(
@@ -202,22 +312,32 @@ defmodule Polyx.Polymarket.LiveOrders do
       #   )
       # end
 
-      order = %{
-        id: System.unique_integer([:positive, :monotonic]),
-        event_type: "price_change",
-        asset_id: asset_id,
-        price: parse_float(change["price"]),
-        size: parse_float(change["size"]),
-        side: change["side"],
-        best_bid: best_bid,
-        best_ask: best_ask,
-        timestamp: data["timestamp"] || System.system_time(:millisecond),
-        market_question: market_info[:question],
-        event_title: market_info[:event_title],
-        outcome: market_info[:outcome]
-      }
+      cond do
+        is_nil(asset_id) ->
+          acc
 
-      add_to_batch(order, acc)
+        is_nil(best_bid) and is_nil(best_ask) and is_nil(price) ->
+          # Drop malformed price update
+          acc
+
+        true ->
+          order = %{
+            id: System.unique_integer([:positive, :monotonic]),
+            event_type: "price_change",
+            asset_id: asset_id,
+            price: price,
+            size: size,
+            side: change["side"],
+            best_bid: best_bid,
+            best_ask: best_ask,
+            timestamp: data["timestamp"] || System.system_time(:millisecond),
+            market_question: market_info[:question],
+            event_title: market_info[:event_title],
+            outcome: market_info[:outcome]
+          }
+
+          add_to_batch(order, acc)
+      end
     end)
   end
 
@@ -272,6 +392,53 @@ defmodule Polyx.Polymarket.LiveOrders do
   defp get_best_price([%{"price" => price} | _]) when is_number(price), do: price
   defp get_best_price(_), do: nil
 
+  defp normalize_asset_ids(asset_ids, state) do
+    asset_ids
+    |> List.wrap()
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+    |> Enum.filter(fn id ->
+      if MapSet.member?(state.subscribed_markets, id) do
+        true
+      else
+        Logger.debug("[LiveOrders] Dropping unsubscribed asset_id=#{id}")
+        false
+      end
+    end)
+  end
+
+  defp send_subscriptions_now(asset_ids, state) do
+    # Polymarket WS expects the typo'd key `assets_ids`; send both for safety.
+    payload = %{
+      operation: "subscribe",
+      type: "market",
+      assets_ids: asset_ids,
+      asset_ids: asset_ids
+    }
+
+    msg = Jason.encode!(payload)
+
+    Logger.info("[LiveOrders] Subscribing to #{length(asset_ids)} markets")
+    Logger.debug("[LiveOrders] Subscription message: #{msg}")
+
+    Fresh.send(__MODULE__, {:text, msg})
+
+    stats =
+      state.subscription_stats
+      |> Map.update(:attempts, 1, &(&1 + 1))
+
+    {%{state | subscription_stats: stats}, true}
+  rescue
+    error ->
+      Logger.error("[LiveOrders] Failed to encode subscription payload: #{inspect(error)}")
+      {state, false}
+  end
+
+  defp schedule_retry(asset_ids, attempt) do
+    delay = min(3_000 * attempt, 15_000)
+    Process.send_after(self(), {:retry_subscriptions, asset_ids, attempt}, delay)
+  end
+
   defp add_to_batch(order, state) do
     new_batch = [order | state.order_batch]
 
@@ -320,15 +487,15 @@ defmodule Polyx.Polymarket.LiveOrders do
     Phoenix.PubSub.broadcast(Polyx.PubSub, @pubsub_topic, message)
   end
 
-  defp parse_float(nil), do: 0.0
+  defp parse_float(nil), do: nil
 
   defp parse_float(val) when is_binary(val) do
     case Float.parse(val) do
       {f, _} -> f
-      :error -> 0.0
+      :error -> nil
     end
   end
 
   defp parse_float(val) when is_number(val), do: val * 1.0
-  defp parse_float(_), do: 0.0
+  defp parse_float(_), do: nil
 end

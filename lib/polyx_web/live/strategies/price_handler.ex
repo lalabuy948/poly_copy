@@ -33,11 +33,11 @@ defmodule PolyxWeb.StrategiesLive.PriceHandler do
         {:noreply, Phoenix.Component.assign(socket, :token_prices, token_prices)}
 
       _ ->
-        # No tokens yet, retry in 2 seconds (max 10 retries)
+        # No tokens yet, retry in 60 seconds (max 10 retries)
         retries = socket.assigns[:discovery_retries] || 0
 
         if retries < 10 do
-          Process.send_after(self(), {:fetch_discovered_tokens, strategy_id}, 2_000)
+          Process.send_after(self(), {:fetch_discovered_tokens, strategy_id}, 60_000)
           {:noreply, Phoenix.Component.assign(socket, :discovery_retries, retries + 1)}
         else
           {:noreply, Phoenix.Component.assign(socket, :token_prices, :no_markets)}

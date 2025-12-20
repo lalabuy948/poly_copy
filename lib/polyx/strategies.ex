@@ -137,11 +137,26 @@ defmodule Polyx.Strategies do
       |> where([t], t.status == "filled")
       |> Repo.aggregate(:count)
 
+    # Get real-time PnL from Polymarket API (same as home page)
     total_pnl =
-      trades
-      |> where([t], not is_nil(t.pnl))
-      |> select([t], sum(t.pnl))
-      |> Repo.one() || Decimal.new(0)
+      case Polyx.Polymarket.Client.get_account_summary() do
+        {:ok, summary} ->
+          # Round to 2 decimals to avoid floating point precision issues
+          summary.total_pnl
+          |> Decimal.from_float()
+          |> Decimal.round(2)
+
+        {:error, _} ->
+          # Fallback to database calculation if API fails
+          trades
+          |> where([t], not is_nil(t.pnl))
+          |> select([t], sum(t.pnl))
+          |> Repo.one()
+          |> case do
+            nil -> Decimal.new(0)
+            val -> Decimal.round(val, 2)
+          end
+      end
 
     %{
       total_trades: total_trades,
