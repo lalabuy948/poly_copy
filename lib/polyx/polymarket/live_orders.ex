@@ -443,11 +443,6 @@ defmodule Polyx.Polymarket.LiveOrders do
       {state, false}
   end
 
-  defp schedule_retry(asset_ids, attempt) do
-    delay = min(3_000 * attempt, 15_000)
-    Process.send_after(self(), {:retry_subscriptions, asset_ids, attempt}, delay)
-  end
-
   defp add_to_batch(order, state) do
     new_batch = [order | state.order_batch]
 
