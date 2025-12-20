@@ -22,22 +22,22 @@ defmodule Polyx.Strategies.Config do
     field :market_timeframe, :string, default: "15m"
 
     # Signal threshold - buy when price exceeds this (e.g., 0.80 = 80%)
-    field :signal_threshold, :float, default: 0.80
+    field :signal_threshold, :float, default: 0.95
 
     # Order size in USD
-    field :order_size, :float, default: 5.0
+    field :order_size, :float, default: 10.0
 
     # Minimum minutes before resolution to trade (overrides preset if set)
     field :min_minutes, :float, default: nil
 
     # Cooldown between trades on same market (seconds)
-    field :cooldown_seconds, :integer, default: 60
+    field :cooldown_seconds, :integer, default: 200
 
     # Use limit order or market order (buy at current best ask)
     field :use_limit_order, :boolean, default: true
 
     # Limit price when use_limit_order is true (e.g., 0.99, 0.989, 0.999)
-    field :limit_price, :float, default: 0.99
+    field :limit_price, :float, default: 0.98
   end
 
   # Hardcoded settings (not exposed in UI)

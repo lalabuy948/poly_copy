@@ -25,7 +25,7 @@ defmodule Polyx.Strategies.TimeDecay do
   require Logger
 
   alias Polyx.Polymarket.{Gamma, Client}
-  alias Polyx.Strategies.TimeDecay.Helpers
+  alias Polyx.Strategies.{Config, TimeDecay.Helpers}
 
   # Minimum order constraints
   @min_order_value 1.0
@@ -33,21 +33,8 @@ defmodule Polyx.Strategies.TimeDecay do
 
   @impl true
   def init(config) do
-    # Merge user config with hardcoded defaults
-    full_config =
-      Map.merge(
-        %{
-          "auto_discover_crypto" => true,
-          "crypto_only" => true,
-          "max_minutes_to_resolution" => 60,
-          "cooldown_seconds" => 60,
-          "min_profit" => 0.01,
-          # Enforce at least 2 minutes between crypto discoveries
-          "discovery_interval_seconds" => 120,
-          "scan_enabled" => false
-        },
-        config
-      )
+    timeframe = config["market_timeframe"] || "15m"
+    full_config = Config.defaults(timeframe) |> Map.merge(config)
 
     state = %{
       config: full_config,
@@ -323,15 +310,15 @@ defmodule Polyx.Strategies.TimeDecay do
     config = state.config
 
     # User-configurable settings
-    signal_threshold = config["signal_threshold"] || config["high_threshold"] || 0.80
-    order_size = config["order_size"] || 5.0
-    min_minutes = config["min_minutes"] || config["min_minutes_to_resolution"] || 1.0
+    signal_threshold = Map.get(config, "signal_threshold") || Map.get(config, "high_threshold")
+    order_size = Map.get(config, "order_size")
+    min_minutes = Map.get(config, "min_minutes") || Map.get(config, "min_minutes_to_resolution")
     use_limit_order = config["use_limit_order"] != false
-    limit_price = config["limit_price"] || config["target_high_price"] || 0.99
+    limit_price = Map.get(config, "limit_price") || Map.get(config, "target_high_price")
 
     # Hardcoded settings
-    cooldown_seconds = config["cooldown_seconds"] || 60
-    min_profit = config["min_profit"] || 0.01
+    cooldown_seconds = config["cooldown_seconds"]
+    min_profit = config["min_profit"]
     crypto_only = config["crypto_only"] != false
 
     # Get market info early to check opposite token cooldown
