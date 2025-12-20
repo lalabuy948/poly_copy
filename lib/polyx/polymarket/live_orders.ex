@@ -147,7 +147,12 @@ defmodule Polyx.Polymarket.LiveOrders do
     if state.ws_ready and asset_ids != [] do
       msg = Jason.encode!(%{assets_ids: asset_ids, type: "market"})
       Logger.info("[LiveOrders] Subscribing to #{length(asset_ids)} markets")
+      Logger.debug("[LiveOrders] Subscription message: #{msg}")
       Fresh.send(__MODULE__, {:text, msg})
+    else
+      if not state.ws_ready do
+        Logger.warning("[LiveOrders] Cannot subscribe - WebSocket not ready")
+      end
     end
 
     {:ok, state}
@@ -180,9 +185,20 @@ defmodule Polyx.Polymarket.LiveOrders do
   defp handle_event("price_change", data, state) do
     price_changes = data["price_changes"] || []
 
+    if price_changes != [] do
+      Logger.debug("[LiveOrders] Received price_change for #{length(price_changes)} assets")
+    end
+
     Enum.reduce(price_changes, state, fn change, acc ->
       asset_id = change["asset_id"]
       market_info = lookup_market_info(asset_id)
+
+      best_bid = parse_float(change["best_bid"])
+      best_ask = parse_float(change["best_ask"])
+
+      if best_bid || best_ask do
+        Logger.debug("[LiveOrders]   → #{market_info[:outcome] || "?"}: bid=#{best_bid}, ask=#{best_ask}")
+      end
 
       order = %{
         id: System.unique_integer([:positive, :monotonic]),
@@ -191,8 +207,8 @@ defmodule Polyx.Polymarket.LiveOrders do
         price: parse_float(change["price"]),
         size: parse_float(change["size"]),
         side: change["side"],
-        best_bid: parse_float(change["best_bid"]),
-        best_ask: parse_float(change["best_ask"]),
+        best_bid: best_bid,
+        best_ask: best_ask,
         timestamp: data["timestamp"] || System.system_time(:millisecond),
         market_question: market_info[:question],
         event_title: market_info[:event_title],

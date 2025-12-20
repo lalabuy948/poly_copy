@@ -26,8 +26,7 @@ defmodule Polyx.Strategies.TimeDecay do
 
   alias Polyx.Polymarket.{Gamma, Client}
 
-  # Polymarket fee structure
-  @taker_fee 0.002
+  # Minimum order constraints
   @min_order_value 1.0
   @min_shares 5
 
@@ -463,8 +462,11 @@ defmodule Polyx.Strategies.TimeDecay do
     min_profit = config["min_profit"] || 0.01
     crypto_only = config["crypto_only"] != false
 
-    # Check cooldown first (fast path)
-    if in_cooldown?(state, asset_id) do
+    # Check if we already placed an order for this token (prevents duplicates in same batch)
+    already_placed = Map.has_key?(state.placed_orders, asset_id)
+
+    # Check cooldown or already placed (fast path)
+    if already_placed or in_cooldown?(state, asset_id) do
       :no_opportunity
     else
       # Calculate price to use (always use midpoint)
@@ -768,16 +770,17 @@ defmodule Polyx.Strategies.TimeDecay do
 
   # Calculate effective order size after fees
   defp calculate_effective_size(order_size, _price, :buy) do
-    # For buys, reduce size by taker fee
-    order_size * (1 - @taker_fee)
+    # Return full order size - fees are charged separately by Polymarket
+    # Previously reduced by taker fee, but that's not needed since feeRateBps=0 in orders
+    order_size
   end
 
   # Estimate profit from trade
   defp estimate_profit(:buy, target_price, size) do
-    # If resolves to 1, profit = (1 - target_price) * shares - fees
+    # If resolves to 1, profit = (1 - target_price) * shares
+    # Fees are charged by Polymarket separately, not included in profit calc
     shares = size / target_price
-    gross = (1 - target_price) * shares
-    gross * (1 - @taker_fee)
+    (1 - target_price) * shares
   end
 
   defp in_cooldown?(state, token_id) do
