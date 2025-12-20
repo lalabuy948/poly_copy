@@ -30,6 +30,7 @@ defmodule Polyx.Polymarket.LiveOrders do
                subscribed_markets: MapSet.new(),
                subscription_retry: %{},
                subscription_stats: %{attempts: 0, retries: 0},
+               last_subscription_at: nil,
                last_message_at: nil,
                health_timer: nil
              },
@@ -112,10 +113,15 @@ defmodule Polyx.Polymarket.LiveOrders do
   end
 
   @impl Fresh
-  def handle_error(error, _state) do
+  def handle_error(error, state) do
     Logger.error("[LiveOrders] WebSocket error: #{inspect(error)}")
     broadcast({:connected, false})
-    :reconnect
+
+    # Reset timers to avoid leaks and ensure clean reconnect
+    if state.batch_timer, do: Process.cancel_timer(state.batch_timer)
+    if state.health_timer, do: Process.cancel_timer(state.health_timer)
+
+    {:reconnect, %{state | ws_ready: false, order_batch: [], batch_timer: nil, health_timer: nil}}
   end
 
   @impl Fresh
@@ -183,18 +189,23 @@ defmodule Polyx.Polymarket.LiveOrders do
   end
 
   def handle_info({:send_subscriptions, asset_ids}, state) do
+    now = System.system_time(:millisecond)
+    recent? = state.last_subscription_at && now - state.last_subscription_at < 60_000
+
     asset_ids = normalize_asset_ids(asset_ids, state)
 
     cond do
       asset_ids == [] ->
         {:ok, state}
 
+      recent? ->
+        {:ok, state}
+
       state.ws_ready ->
         {state, sent?} = send_subscriptions_now(asset_ids, state)
 
-        if sent? do
-          schedule_retry(asset_ids, 1)
-        end
+        state =
+          if sent?, do: %{state | last_subscription_at: now}, else: state
 
         {:ok, state}
 
@@ -206,13 +217,18 @@ defmodule Polyx.Polymarket.LiveOrders do
   end
 
   def handle_info({:retry_subscriptions, asset_ids, attempt}, state) do
+    now = System.system_time(:millisecond)
+    recent? = state.last_subscription_at && now - state.last_subscription_at < 60_000
     asset_ids = normalize_asset_ids(asset_ids, state)
 
     cond do
       asset_ids == [] ->
         {:ok, state}
 
-      state.ws_ready ->
+      recent? ->
+        {:ok, state}
+
+      state.ws_ready and attempt <= 2 ->
         {state, sent?} = send_subscriptions_now(asset_ids, state)
 
         state =
@@ -221,9 +237,7 @@ defmodule Polyx.Polymarket.LiveOrders do
               state.subscription_stats
               |> Map.update(:retries, 1, &(&1 + 1))
 
-            # keep retrying, but cap delay growth
-            schedule_retry(asset_ids, min(attempt + 1, 10))
-            %{state | subscription_stats: stats}
+            %{state | subscription_stats: stats, last_subscription_at: now}
           else
             state
           end
@@ -231,11 +245,6 @@ defmodule Polyx.Polymarket.LiveOrders do
         {:ok, state}
 
       true ->
-        Logger.warning(
-          "[LiveOrders] WebSocket not ready (retry #{attempt}) - rescheduling subscriptions"
-        )
-
-        Process.send_after(self(), {:retry_subscriptions, asset_ids, attempt + 1}, 2_000)
         {:ok, state}
     end
   end
