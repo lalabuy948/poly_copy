@@ -185,9 +185,9 @@ defmodule Polyx.Polymarket.LiveOrders do
   defp handle_event("price_change", data, state) do
     price_changes = data["price_changes"] || []
 
-    if price_changes != [] do
-      Logger.debug("[LiveOrders] Received price_change for #{length(price_changes)} assets")
-    end
+    # if price_changes != [] do
+    #   Logger.debug("[LiveOrders] Received price_change for #{length(price_changes)} assets")
+    # end
 
     Enum.reduce(price_changes, state, fn change, acc ->
       asset_id = change["asset_id"]
@@ -196,9 +196,11 @@ defmodule Polyx.Polymarket.LiveOrders do
       best_bid = parse_float(change["best_bid"])
       best_ask = parse_float(change["best_ask"])
 
-      if best_bid || best_ask do
-        Logger.debug("[LiveOrders]   → #{market_info[:outcome] || "?"}: bid=#{best_bid}, ask=#{best_ask}")
-      end
+      # if best_bid || best_ask do
+      #   Logger.debug(
+      #     "[LiveOrders]   → #{market_info[:outcome] || "?"}: bid=#{best_bid}, ask=#{best_ask}"
+      #   )
+      # end
 
       order = %{
         id: System.unique_integer([:positive, :monotonic]),

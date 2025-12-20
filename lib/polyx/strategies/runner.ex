@@ -359,7 +359,10 @@ defmodule Polyx.Strategies.Runner do
       # Log each token being subscribed
       Enum.each(added, fn token_id ->
         token_info = new_discovered_tokens[token_id]
-        Logger.info("[Runner]   → Subscribing: #{token_info[:outcome] || "?"} - #{token_info[:market_question] || "unknown"}")
+
+        Logger.info(
+          "[Runner]   → Subscribing: #{token_info[:outcome] || "?"} - #{token_info[:market_question] || "unknown"}"
+        )
       end)
 
       LiveOrders.subscribe_to_markets(added)
