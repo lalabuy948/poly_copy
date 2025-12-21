@@ -29,8 +29,8 @@ defmodule PolyxWeb.Components.Strategies.ConfigDisplay do
             <span class="font-medium">{format_percent(@config["signal_threshold"] || 0.8)}</span>
           </div>
           <div class="flex justify-between items-center">
-            <span class="text-base-content/60">Order Size</span>
-            <span class="font-medium">${@config["order_size"] || 5}</span>
+            <span class="text-base-content/60">Shares</span>
+            <span class="font-medium">{@config["order_size"] || 5}</span>
           </div>
           <div class="flex justify-between items-center">
             <span class="text-base-content/60">Min Minutes</span>

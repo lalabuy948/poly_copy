@@ -104,25 +104,23 @@ defmodule PolyxWeb.StrategiesLive.PriceHandler do
   """
   def handle_price_update(socket, token_id, price_data) do
     current = if is_map(socket.assigns.token_prices), do: socket.assigns.token_prices, else: %{}
+    existing = Map.get(current, token_id, %{})
 
-    if Map.has_key?(current, token_id) do
-      existing = Map.get(current, token_id, %{})
+    # Some price updates can arrive before discovery has populated token_prices.
+    # In that case, create an entry so the UI can render immediately.
+    updated =
+      Map.merge(existing, %{
+        best_bid: price_data.best_bid || existing[:best_bid],
+        best_ask: price_data.best_ask || existing[:best_ask],
+        mid: PriceUtils.calculate_mid(price_data.best_bid, price_data.best_ask) || existing[:mid],
+        market_question:
+          price_data[:market_question] || existing[:market_question] || "Loading...",
+        event_title: price_data[:event_title] || existing[:event_title],
+        outcome: price_data[:outcome] || existing[:outcome],
+        end_date: price_data[:end_date] || existing[:end_date]
+      })
 
-      updated =
-        Map.merge(existing, %{
-          best_bid: price_data.best_bid || existing[:best_bid],
-          best_ask: price_data.best_ask || existing[:best_ask],
-          mid:
-            PriceUtils.calculate_mid(price_data.best_bid, price_data.best_ask) ||
-              existing[:mid],
-          market_question: price_data[:market_question] || existing[:market_question],
-          outcome: price_data[:outcome] || existing[:outcome]
-        })
-
-      {:noreply,
-       Phoenix.Component.assign(socket, :token_prices, Map.put(current, token_id, updated))}
-    else
-      {:noreply, socket}
-    end
+    {:noreply,
+     Phoenix.Component.assign(socket, :token_prices, Map.put(current, token_id, updated))}
   end
 end

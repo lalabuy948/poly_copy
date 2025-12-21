@@ -61,7 +61,7 @@ defmodule PolyxWeb.Components.Strategies.ConfigForm do
             />
           </div>
           <div class="flex justify-between items-center">
-            <span class="text-base-content/60">Order Size</span>
+            <span class="text-base-content/60">Shares</span>
             <input
               type="number"
               name={@form[:order_size].name}

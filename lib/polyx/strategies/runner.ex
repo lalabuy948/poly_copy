@@ -11,7 +11,8 @@ defmodule Polyx.Strategies.Runner do
 
   alias Polyx.Strategies
   alias Polyx.Strategies.Behaviour
-  alias Polyx.Polymarket.LiveOrders
+  alias Polyx.Polymarket.{LiveOrders, Client}
+  alias PolyxWeb.StrategiesLive.PriceUtils
 
   @tick_interval 5_000
   # Minimal throttle - let LiveView handle batching for better responsiveness
@@ -358,30 +359,43 @@ defmodule Polyx.Strategies.Runner do
       end)
 
     # Handle added tokens
-    if added != [] do
-      Logger.info("[Runner] Discovered #{length(added)} new tokens, subscribing to WebSocket")
+    {runner_state, new_discovered_tokens} =
+      if added != [] do
+        Logger.info("[Runner] Discovered #{length(added)} new tokens, subscribing to WebSocket")
 
-      # Log each token being subscribed
-      Enum.each(added, fn token_id ->
-        token_info = new_discovered_tokens[token_id]
+        # Log each token being subscribed
+        Enum.each(added, fn token_id ->
+          token_info = new_discovered_tokens[token_id]
 
-        Logger.info(
-          "[Runner]   → Subscribing: #{token_info[:outcome] || "?"} - #{token_info[:market_question] || "unknown"}"
+          Logger.info(
+            "[Runner]   → Subscribing: #{token_info[:outcome] || "?"} - #{token_info[:market_question] || "unknown"}"
+          )
+        end)
+
+        LiveOrders.subscribe_to_markets(added)
+
+        # Seed initial prices from orderbooks so UI shows bid/ask before WS ticks arrive
+        seeded_prices = fetch_initial_prices(added, new_discovered_tokens)
+        merged_prices = Map.merge(runner_state.token_prices, seeded_prices)
+
+        Enum.each(seeded_prices, fn {token_id, price_data} ->
+          broadcast_price_update(strategy_id, token_id, price_data)
+        end)
+
+        # Broadcast new tokens to UI
+        tokens_with_info =
+          Enum.map(added, fn token_id -> {token_id, new_discovered_tokens[token_id]} end)
+
+        Phoenix.PubSub.broadcast(
+          Polyx.PubSub,
+          "strategies:#{strategy_id}",
+          {:discovered_tokens, tokens_with_info}
         )
-      end)
 
-      LiveOrders.subscribe_to_markets(added)
-
-      # Broadcast new tokens to UI
-      tokens_with_info =
-        Enum.map(added, fn token_id -> {token_id, new_discovered_tokens[token_id]} end)
-
-      Phoenix.PubSub.broadcast(
-        Polyx.PubSub,
-        "strategies:#{strategy_id}",
-        {:discovered_tokens, tokens_with_info}
-      )
-    end
+        {%{runner_state | token_prices: merged_prices}, new_discovered_tokens}
+      else
+        {runner_state, new_discovered_tokens}
+      end
 
     # Handle removed tokens
     if removed != [] do
@@ -707,6 +721,60 @@ defmodule Polyx.Strategies.Runner do
       })
     end
   end
+
+  # Seed initial prices via REST orderbook for newly added tokens
+  defp fetch_initial_prices(token_ids, discovered_tokens) do
+    now = System.system_time(:millisecond)
+
+    token_ids
+    |> Task.async_stream(
+      fn token_id ->
+        case Client.get_orderbook(token_id) do
+          {:ok, %{"bids" => bids, "asks" => asks}} ->
+            best_bid = get_best_price(bids)
+            best_ask = get_best_price(asks)
+            mid = PriceUtils.calculate_mid(best_bid, best_ask)
+            info = Map.get(discovered_tokens, token_id, %{})
+
+            price_data = %{
+              best_bid: best_bid,
+              best_ask: best_ask,
+              mid: mid,
+              market_question: info[:market_question],
+              event_title: info[:event_title],
+              outcome: info[:outcome],
+              end_date: info[:end_date],
+              updated_at: now
+            }
+
+            {token_id, price_data}
+
+          _ ->
+            nil
+        end
+      end,
+      max_concurrency: 5,
+      timeout: 5_000,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce(%{}, fn
+      {:ok, {token_id, price_data}}, acc when is_map(price_data) ->
+        Map.put(acc, token_id, price_data)
+
+      _other, acc ->
+        acc
+    end)
+  end
+
+  defp get_best_price([%{"price" => price} | _]) when is_binary(price) do
+    case Float.parse(price) do
+      {val, _} -> val
+      :error -> nil
+    end
+  end
+
+  defp get_best_price([%{"price" => price} | _]) when is_number(price), do: price
+  defp get_best_price(_), do: nil
 
   # Extract target tokens from strategy config
   defp extract_target_tokens(config) do

@@ -135,7 +135,7 @@ defmodule Polyx.Strategies.TimeDecay do
       config["discovery_interval_seconds"]
       |> case do
         nil -> 120
-        val when val < 120 -> 120
+        val when val < 60 -> 60
         val -> val
       end
 

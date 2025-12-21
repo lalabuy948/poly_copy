@@ -11,7 +11,8 @@ defmodule Polyx.Polymarket.Client do
   alias Polyx.Polymarket.RateLimiter
   alias Polyx.Polymarket.Client.{Auth, RequestBuilder, RetryHandler, Pagination}
 
-  @req_options [retry: false, receive_timeout: 10_000]
+  # Slightly higher receive_timeout to tolerate slow Data API responses
+  @req_options [retry: false, receive_timeout: 20_000]
 
   # Custom error struct for better error context
   defmodule APIError do

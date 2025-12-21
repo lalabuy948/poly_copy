@@ -47,8 +47,15 @@ defmodule Polyx.Polymarket.Client.RetryHandler do
         {:error, error}
 
       {:error, %Req.TransportError{reason: reason}} when retries_left > 0 ->
-        Logger.warning("#{api_name} transport error: #{inspect(reason)}, retrying")
-        Process.sleep(500)
+        attempt = @max_retries - retries_left + 1
+        # Exponential-ish backoff to avoid hammering on flaky network/API timeouts
+        wait_ms = min(5_000, 500 * attempt * attempt)
+
+        Logger.warning(
+          "#{api_name} transport error: #{inspect(reason)}, retrying in #{wait_ms}ms (#{retries_left} left)"
+        )
+
+        Process.sleep(wait_ms)
         do_with_retry(request_fn, retries_left - 1, api_name, path)
 
       {:error, reason} ->
