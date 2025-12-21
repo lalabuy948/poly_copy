@@ -2,16 +2,13 @@ defmodule Polyx.Credentials do
   @moduledoc """
   Schema and functions for managing Polymarket API credentials.
   Credentials are stored in the database instead of .env files.
-  Uses ETS caching to avoid repeated database queries.
+  Uses an Agent for caching to avoid repeated database queries.
   """
 
   use Ecto.Schema
   import Ecto.Changeset
 
   alias Polyx.Repo
-
-  @cache_table :credentials_cache
-  @cache_key :default_credentials
 
   schema "credentials" do
     field :key, :string, default: "default"
@@ -71,18 +68,16 @@ defmodule Polyx.Credentials do
   @doc """
   Gets the credentials record, creating a default one if it doesn't exist.
   Uses a singleton pattern with key="default".
-  Results are cached in ETS to avoid repeated database queries.
+  Results are cached in an Agent to avoid repeated database queries.
   """
   def get_or_create do
-    ensure_cache_table()
-
-    case :ets.lookup(@cache_table, @cache_key) do
-      [{@cache_key, credentials}] ->
+    case Polyx.Credentials.Cache.get() do
+      nil ->
+        credentials = fetch_or_create_from_db()
+        Polyx.Credentials.Cache.put(credentials)
         credentials
 
-      [] ->
-        credentials = fetch_or_create_from_db()
-        :ets.insert(@cache_table, {@cache_key, credentials})
+      credentials ->
         credentials
     end
   end
@@ -99,27 +94,11 @@ defmodule Polyx.Credentials do
     end
   end
 
-  defp ensure_cache_table do
-    case :ets.whereis(@cache_table) do
-      :undefined ->
-        # Handle race condition - another process may have created it between check and create
-        try do
-          :ets.new(@cache_table, [:named_table, :public, :set])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _ ->
-        :ok
-    end
-  end
-
   @doc """
   Invalidates the credentials cache. Call after updates.
   """
   def invalidate_cache do
-    ensure_cache_table()
-    :ets.delete(@cache_table, @cache_key)
+    Polyx.Credentials.Cache.clear()
   end
 
   @doc """
@@ -214,5 +193,28 @@ defmodule Polyx.Credentials do
     else
       String.slice(value, 0, 4) <> String.duplicate("•", len - 8) <> String.slice(value, -4, 4)
     end
+  end
+end
+
+defmodule Polyx.Credentials.Cache do
+  @moduledoc """
+  Simple Agent-based cache for credentials.
+  """
+  use Agent
+
+  def start_link(_opts) do
+    Agent.start_link(fn -> nil end, name: __MODULE__)
+  end
+
+  def get do
+    Agent.get(__MODULE__, & &1)
+  end
+
+  def put(credentials) do
+    Agent.update(__MODULE__, fn _ -> credentials end)
+  end
+
+  def clear do
+    Agent.update(__MODULE__, fn _ -> nil end)
   end
 end

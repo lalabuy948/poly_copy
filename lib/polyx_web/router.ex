@@ -19,6 +19,7 @@ defmodule PolyxWeb.Router do
 
     live "/", HomeLive
     live "/strategies", StrategiesLive
+    live "/strategies/:strategy_id", StrategiesLive
     live "/profile/:address", ProfileLive
   end
 

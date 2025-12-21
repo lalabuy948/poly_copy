@@ -26,12 +26,13 @@ import {hooks as colocatedHooks} from "phoenix-colocated/polyx"
 import topbar from "../vendor/topbar"
 import "../vendor/chart"
 import {TradeDotsChart, CumulativeSharesChart, CumulativeDollarsChart, ExposureChart, PnLChart, MarketTagsChart} from "./profile_charts"
+import {PriceFlash} from "./price_flash_hook"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, TradeDotsChart, CumulativeSharesChart, CumulativeDollarsChart, ExposureChart, PnLChart, MarketTagsChart},
+  hooks: {...colocatedHooks, TradeDotsChart, CumulativeSharesChart, CumulativeDollarsChart, ExposureChart, PnLChart, MarketTagsChart, PriceFlash},
 })
 
 // Show progress bar on live navigation and form submits

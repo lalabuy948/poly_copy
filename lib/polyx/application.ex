@@ -5,6 +5,8 @@ defmodule Polyx.Application do
 
   use Application
 
+  require Logger
+
   @impl true
   def start(_type, _args) do
     children = [
@@ -14,8 +16,10 @@ defmodule Polyx.Application do
       {Phoenix.PubSub, name: Polyx.PubSub},
       # API rate limiter (must start before clients)
       Polyx.Polymarket.RateLimiter,
-      # ETS cache owner for Gamma market lookups
+      # Cache for Gamma market lookups
       Polyx.Polymarket.GammaCache,
+      # Cache for credentials
+      Polyx.Credentials.Cache,
       # Copy trading GenServers
       Polyx.CopyTrading.TradeWatcher,
       Polyx.CopyTrading.TradeExecutor,
@@ -30,7 +34,22 @@ defmodule Polyx.Application do
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Polyx.Supervisor]
-    Supervisor.start_link(children, opts)
+    result = Supervisor.start_link(children, opts)
+
+    # Auto-recover strategies after supervision tree is up
+    schedule_strategy_recovery()
+
+    result
+  end
+
+  # Schedule auto-recovery of strategies that were running before shutdown
+  defp schedule_strategy_recovery do
+    Task.start(fn ->
+      # Wait for Engine to be fully ready
+      Process.sleep(2_000)
+      Logger.info("[Application] Auto-recovering strategies that were running before shutdown...")
+      Polyx.Strategies.Engine.auto_start_strategies()
+    end)
   end
 
   # Tell Phoenix to update the endpoint configuration

@@ -32,10 +32,11 @@ defmodule PolyxWeb.ConnCase do
   end
 
   setup tags do
+    async? = Map.get(tags, :async, false) == true
     pid = Polyx.DataCase.setup_sandbox(tags)
 
     # Allow the GenServers to access the sandbox in shared mode
-    if is_pid(pid) and not tags[:async] do
+    if is_pid(pid) and not async? do
       # Use shared mode so GenServers can access the database
       Ecto.Adapters.SQL.Sandbox.mode(Polyx.Repo, {:shared, pid})
     end
