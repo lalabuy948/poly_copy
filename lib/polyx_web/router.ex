@@ -1,6 +1,8 @@
 defmodule PolyxWeb.Router do
   use PolyxWeb, :router
 
+  import Plug.BasicAuth
+
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
@@ -14,8 +16,14 @@ defmodule PolyxWeb.Router do
     plug :accepts, ["json"]
   end
 
+  pipeline :admin_auth do
+    if Application.compile_env(:polyx, :basic_auth) do
+      plug :basic_auth, Application.compile_env(:polyx, :basic_auth)
+    end
+  end
+
   scope "/", PolyxWeb do
-    pipe_through :browser
+    pipe_through [:browser, :admin_auth]
 
     live "/", HomeLive
     live "/strategies", StrategiesLive

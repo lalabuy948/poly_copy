@@ -1,0 +1,19 @@
+services:
+  polyx:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      - PHX_SERVER=true
+      - DATABASE_PATH=/app/data/polyx.db
+      - PORT=4000
+    volumes:
+      - polyx_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  polyx_data:
