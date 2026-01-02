@@ -16,5 +16,9 @@ config :swoosh, local: false
 # Do not print debug messages in production
 config :logger, level: :info
 
+config :polyx, :basic_auth,
+  username: System.get_env("ADMIN_USERNAME"),
+  password: System.get_env("ADMIN_PASSWORD")
+
 # Runtime production configuration, including reading
 # of environment variables, is done on config/runtime.exs.

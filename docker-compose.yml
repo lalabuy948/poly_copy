@@ -1,0 +1,18 @@
+services:
+  polyx:
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4005:4005"
+    environment:
+      - PHX_SERVER=true
+      - DATABASE_PATH=/app/polyx.db
+      - PORT=4005
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      - ./polyx.db:/app/polyx.db
+    restart: unless-stopped

@@ -4,7 +4,8 @@
       "Bash(mix compile:*)",
       "Bash(git checkout:*)",
       "Bash(git add:*)",
-      "Bash(mix precommit:*)"
+      "Bash(mix precommit:*)",
+      "Bash(cat:*)"
     ]
   }
 }

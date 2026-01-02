@@ -11,6 +11,13 @@ if System.get_env("PHX_SERVER") do
   config :polyx, PolyxWeb.Endpoint, server: true
 end
 
+# Optional basic auth - only enabled when both env vars are set
+if username = System.get_env("ADMIN_USERNAME") do
+  if password = System.get_env("ADMIN_PASSWORD") do
+    config :polyx, :basic_auth, username: username, password: password
+  end
+end
+
 if config_env() == :prod do
   # Database is created next to the binary itself
   # __BURRITO_BIN_PATH is set by Burrito to the original binary location

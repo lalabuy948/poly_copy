@@ -34,6 +34,12 @@ defmodule Polyx.MixProject do
 
   def releases do
     [
+      # Standard release for Docker
+      polyx: [
+        steps: [:assemble],
+        validate_compile_env: false
+      ],
+      # Burrito release for standalone executables
       poly_copy: [
         steps: [:assemble, &Burrito.wrap/1],
         burrito: [
