@@ -81,7 +81,7 @@ defmodule PolyxWeb.Components.Strategies.ConfigDisplay do
 
   defp delta_arb_display(assigns) do
     ~H"""
-    <div class="pb-2 border-b border-base-300 flex gap-2">
+    <div class="pb-2 border-b border-base-300 flex gap-2 flex-wrap">
       <div>
         <span class="text-base-content/60 text-xs">Market Type</span>
         <div class="mt-1">
@@ -91,10 +91,13 @@ defmodule PolyxWeb.Components.Strategies.ConfigDisplay do
         </div>
       </div>
       <div :if={@config["market_type"] != "sports"}>
-        <span class="text-base-content/60 text-xs">Timeframe</span>
-        <div class="mt-1">
-          <span class="px-3 py-1 rounded-lg bg-primary/10 text-primary font-medium text-sm">
-            {timeframe_label(@config["market_timeframe"])}
+        <span class="text-base-content/60 text-xs">Timeframes</span>
+        <div class="mt-1 flex gap-1 flex-wrap">
+          <span
+            :for={tf <- parse_timeframes(@config["market_timeframes"] || @config["market_timeframe"])}
+            class="px-2 py-1 rounded-lg bg-primary/10 text-primary font-medium text-xs"
+          >
+            {timeframe_label(tf)}
           </span>
         </div>
       </div>
@@ -150,4 +153,19 @@ defmodule PolyxWeb.Components.Strategies.ConfigDisplay do
   end
 
   defp format_combined_threshold(_), do: "0.96"
+
+  # Parse timeframes from various formats
+  defp parse_timeframes(nil), do: ["15m"]
+  defp parse_timeframes(list) when is_list(list), do: list
+
+  defp parse_timeframes(str) when is_binary(str) do
+    str
+    |> String.split(",")
+    |> Enum.map(&String.trim/1)
+    |> Enum.filter(&(&1 != ""))
+    |> case do
+      [] -> ["15m"]
+      list -> list
+    end
+  end
 end

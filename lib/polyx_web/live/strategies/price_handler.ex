@@ -14,33 +14,46 @@ defmodule PolyxWeb.StrategiesLive.PriceHandler do
   Returns {:noreply, socket} with updated token_prices and discovery_retries assigns.
   """
   def handle_fetch_discovered_tokens(socket, strategy_id) do
+    current_prices =
+      if is_map(socket.assigns.token_prices), do: socket.assigns.token_prices, else: %{}
+
     case Runner.get_discovered_tokens_with_info(strategy_id) do
       {:ok, tokens_map} when map_size(tokens_map) > 0 ->
-        # Convert to UI format - prices come from Runner's WebSocket cache
-        token_prices =
+        # Convert to UI format, but MERGE with existing prices to preserve WebSocket updates
+        new_prices =
           Enum.reduce(tokens_map, %{}, fn {token_id, info}, acc ->
+            existing = Map.get(current_prices, token_id, %{})
+
             Map.put(acc, token_id, %{
-              best_bid: info[:best_bid],
-              best_ask: info[:best_ask],
-              mid: PriceUtils.calculate_mid(info[:best_bid], info[:best_ask]),
-              market_question: info[:market_question] || "Loading...",
-              event_title: info[:event_title],
-              outcome: info[:outcome],
-              end_date: info[:end_date]
+              # Prefer existing WebSocket prices over initial fetch (they're more recent)
+              best_bid: existing[:best_bid] || info[:best_bid],
+              best_ask: existing[:best_ask] || info[:best_ask],
+              mid: existing[:mid] || PriceUtils.calculate_mid(info[:best_bid], info[:best_ask]),
+              market_question: info[:market_question] || existing[:market_question] || "Loading...",
+              event_title: info[:event_title] || existing[:event_title],
+              outcome: info[:outcome] || existing[:outcome],
+              end_date: info[:end_date] || existing[:end_date]
             })
           end)
 
-        {:noreply, Phoenix.Component.assign(socket, :token_prices, token_prices)}
+        merged = Map.merge(current_prices, new_prices)
+        {:noreply, Phoenix.Component.assign(socket, :token_prices, merged)}
 
       _ ->
-        # No tokens yet, retry in 60 seconds (max 10 retries)
-        retries = socket.assigns[:discovery_retries] || 0
-
-        if retries < 10 do
-          Process.send_after(self(), {:fetch_discovered_tokens, strategy_id}, 60_000)
-          {:noreply, Phoenix.Component.assign(socket, :discovery_retries, retries + 1)}
+        # No tokens yet from Runner, but DON'T wipe existing prices from WebSocket
+        if map_size(current_prices) > 0 do
+          # We already have prices, keep them
+          {:noreply, socket}
         else
-          {:noreply, Phoenix.Component.assign(socket, :token_prices, :no_markets)}
+          # No tokens yet, retry in 60 seconds (max 10 retries)
+          retries = socket.assigns[:discovery_retries] || 0
+
+          if retries < 10 do
+            Process.send_after(self(), {:fetch_discovered_tokens, strategy_id}, 60_000)
+            {:noreply, Phoenix.Component.assign(socket, :discovery_retries, retries + 1)}
+          else
+            {:noreply, Phoenix.Component.assign(socket, :token_prices, :no_markets)}
+          end
         end
     end
   end

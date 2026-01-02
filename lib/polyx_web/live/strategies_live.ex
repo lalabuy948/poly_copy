@@ -205,31 +205,20 @@ defmodule PolyxWeb.StrategiesLive do
       )
     end
 
-    # Subscribe to new
-    Phoenix.PubSub.subscribe(Polyx.PubSub, "strategies:#{id}")
-
     # Enrich with actual running state
     is_running = Engine.running?(id)
     enriched = %{strategy | status: if(is_running, do: "running", else: "stopped")}
 
-    # Load trades
-    trades = Strategies.list_trades(id, limit: 50)
-    paper_orders = Enum.map(trades, &State.trade_to_paper_order/1)
+    # Use State.subscribe_to_strategy which fetches tokens synchronously
+    # This avoids the flash of empty state
+    socket =
+      socket
+      |> assign(:selected_strategy, %{strategy: enriched, stats: stats})
+      |> State.subscribe_to_strategy(id)
+      |> stream(:events, events, reset: true)
+      |> stream(:live_orders, [], reset: true)
 
-    # Request discovered tokens if running
-    if is_running do
-      send(self(), {:fetch_discovered_tokens, id})
-    end
-
-    {:noreply,
-     socket
-     |> assign(:selected_strategy, %{strategy: enriched, stats: stats})
-     |> assign(:token_prices, %{})
-     |> assign(:discovery_retries, 0)
-     |> assign(:paper_orders, paper_orders)
-     |> stream(:events, events, reset: true)
-     |> stream(:live_orders, [], reset: true)
-     |> push_patch(to: ~p"/strategies/#{id}")}
+    {:noreply, push_patch(socket, to: ~p"/strategies/#{id}")}
   end
 
   @impl true

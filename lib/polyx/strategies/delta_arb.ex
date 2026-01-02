@@ -145,32 +145,28 @@ defmodule Polyx.Strategies.DeltaArb do
   end
 
   @doc """
-  Discover markets based on configured market type and timeframe.
+  Discover markets based on configured market type and timeframes.
   Called by Runner as `discover_crypto_markets/1`.
+  Supports multiple timeframes - queries each and combines results.
   """
   def discover_crypto_markets(state) do
     config = state.config
     max_minutes = config["max_minutes_to_resolution"] || 60
     min_minutes = config["min_minutes_to_resolution"] || 1
-    market_timeframe = config["market_timeframe"] || "15m"
     market_type = config["market_type"] || "crypto"
 
-    Logger.info(
-      "[DeltaArb] Starting discovery: type=#{market_type}, timeframe=#{market_timeframe}, max_minutes=#{max_minutes}"
-    )
+    # Get timeframes - supports both list and comma-separated string
+    market_timeframes = get_timeframes(config)
 
-    intervals = Helpers.timeframe_to_intervals(market_timeframe)
+    Logger.info(
+      "[DeltaArb] Starting discovery: type=#{market_type}, timeframes=#{inspect(market_timeframes)}, max_minutes=#{max_minutes}"
+    )
 
     # Fetch markets based on type
     events_result =
       case market_type do
         "crypto" ->
-          Gamma.fetch_crypto_markets_ending_soon(
-            max_minutes: max_minutes,
-            min_minutes: min_minutes,
-            intervals: intervals,
-            limit: 100
-          )
+          fetch_crypto_for_timeframes(market_timeframes, max_minutes, min_minutes)
 
         "sports" ->
           fetch_sports_markets(max_minutes, min_minutes)
@@ -178,23 +174,13 @@ defmodule Polyx.Strategies.DeltaArb do
         "all" ->
           # Combine crypto and sports
           with {:ok, crypto_events} <-
-                 Gamma.fetch_crypto_markets_ending_soon(
-                   max_minutes: max_minutes,
-                   min_minutes: min_minutes,
-                   intervals: intervals,
-                   limit: 50
-                 ),
+                 fetch_crypto_for_timeframes(market_timeframes, max_minutes, min_minutes),
                {:ok, sports_events} <- fetch_sports_markets(max_minutes, min_minutes) do
             {:ok, crypto_events ++ sports_events}
           end
 
         _ ->
-          Gamma.fetch_crypto_markets_ending_soon(
-            max_minutes: max_minutes,
-            min_minutes: min_minutes,
-            intervals: intervals,
-            limit: 100
-          )
+          fetch_crypto_for_timeframes(market_timeframes, max_minutes, min_minutes)
       end
 
     case events_result do
@@ -205,6 +191,50 @@ defmodule Polyx.Strategies.DeltaArb do
       {:error, reason} ->
         Logger.warning("[DeltaArb] Discovery failed: #{inspect(reason)}")
         {:ok, state}
+    end
+  end
+
+  # Get timeframes from config, handling both list and string formats
+  defp get_timeframes(config) do
+    case config["market_timeframes"] do
+      nil -> ["15m"]
+      list when is_list(list) -> list
+      str when is_binary(str) -> Config.parse_timeframes(str)
+    end
+  end
+
+  # Fetch crypto markets for multiple timeframes
+  defp fetch_crypto_for_timeframes(timeframes, max_minutes, min_minutes) do
+    results =
+      timeframes
+      |> Enum.map(fn timeframe ->
+        intervals = Helpers.timeframe_to_intervals(timeframe)
+
+        Gamma.fetch_crypto_markets_ending_soon(
+          max_minutes: max_minutes,
+          min_minutes: min_minutes,
+          intervals: intervals,
+          limit: 50
+        )
+      end)
+
+    # Combine all successful results
+    events =
+      results
+      |> Enum.flat_map(fn
+        {:ok, events} -> events
+        {:error, _} -> []
+      end)
+      |> Enum.uniq_by(fn event -> event[:slug] || event[:id] end)
+
+    if events == [] do
+      # If all failed, return the first error
+      case Enum.find(results, &match?({:error, _}, &1)) do
+        {:error, _} = error -> error
+        nil -> {:ok, []}
+      end
+    else
+      {:ok, events}
     end
   end
 
@@ -416,6 +446,7 @@ defmodule Polyx.Strategies.DeltaArb do
 
       if valid? do
         Logger.info("[DeltaArb] ✅ Valid arb opportunity! Generating signals...")
+
         generate_pair_signals(
           state,
           token_a,
@@ -556,9 +587,8 @@ defmodule Polyx.Strategies.DeltaArb do
     config = state.config
     max_minutes = config["max_minutes_to_resolution"] || 15
     min_minutes = config["min_minutes_to_resolution"] || 1
-    market_timeframe = config["market_timeframe"] || "15m"
     market_type = config["market_type"] || "crypto"
-    intervals = Helpers.timeframe_to_intervals(market_timeframe)
+    market_timeframes = get_timeframes(config)
 
     # Fetch current active markets
     events_result =
@@ -567,12 +597,7 @@ defmodule Polyx.Strategies.DeltaArb do
           fetch_sports_markets(max_minutes, min_minutes)
 
         _ ->
-          Gamma.fetch_crypto_markets_ending_soon(
-            max_minutes: max_minutes,
-            min_minutes: min_minutes,
-            intervals: intervals,
-            limit: 100
-          )
+          fetch_crypto_for_timeframes(market_timeframes, max_minutes, min_minutes)
       end
 
     case events_result do

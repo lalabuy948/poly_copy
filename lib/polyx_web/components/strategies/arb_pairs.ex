@@ -18,19 +18,38 @@ defmodule PolyxWeb.Components.Strategies.ArbPairs do
     pairs = build_pairs(assigns.token_prices)
     min_spread = assigns.config["min_spread"] || 0.04
 
+    # Count tokens with prices vs total
+    {with_prices, total} = count_tokens_with_prices(assigns.token_prices)
+
     assigns =
       assigns
       |> assign(:pairs, pairs)
       |> assign(:min_spread, min_spread)
+      |> assign(:tokens_with_prices, with_prices)
+      |> assign(:total_tokens, total)
 
     ~H"""
     <div class="rounded-2xl bg-base-200/50 border border-base-300 overflow-hidden">
       <div class="px-4 py-3 border-b border-base-300">
-        <div class="flex items-center gap-2">
-          <.icon name="hero-scale" class="size-4 text-success" />
-          <h3 class="font-medium text-sm">Arb Opportunities</h3>
-          <span class="px-1.5 py-0.5 rounded-full bg-success/10 text-success text-[10px] font-medium">
-            {length(@pairs)} pairs
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <.icon name="hero-scale" class="size-4 text-success" />
+            <h3 class="font-medium text-sm">Arb Opportunities</h3>
+            <span class="px-1.5 py-0.5 rounded-full bg-success/10 text-success text-[10px] font-medium">
+              {length(@pairs)} pairs
+            </span>
+          </div>
+          <span
+            :if={@total_tokens > 0}
+            class="text-[10px] text-base-content/50"
+            title="Tokens with prices / Total discovered"
+          >
+            <span
+              :if={@tokens_with_prices < @total_tokens}
+              class="loading loading-spinner loading-xs mr-1"
+            >
+            </span>
+            {@tokens_with_prices}/{@total_tokens} tokens
           </span>
         </div>
       </div>
@@ -164,6 +183,20 @@ defmodule PolyxWeb.Components.Strategies.ArbPairs do
   end
 
   defp build_pairs(_), do: []
+
+  # Count tokens with prices vs total discovered
+  defp count_tokens_with_prices(token_prices) when is_map(token_prices) do
+    total = map_size(token_prices)
+
+    with_prices =
+      Enum.count(token_prices, fn {_id, data} ->
+        data[:best_ask] != nil or data[:best_bid] != nil
+      end)
+
+    {with_prices, total}
+  end
+
+  defp count_tokens_with_prices(_), do: {0, 0}
 
   defp pair_class(spread, min_spread) when is_number(spread) do
     cond do

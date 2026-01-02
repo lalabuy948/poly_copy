@@ -256,28 +256,28 @@ defmodule PolyxWeb.Components.Strategies.ConfigForm do
       </div>
     </div>
 
-    <%!-- Market Timeframe Section (only for crypto) --%>
+    <%!-- Market Timeframes Section (only for crypto) - Multi-select --%>
     <div
       :if={Phoenix.HTML.Form.input_value(@form, :market_type) != "sports"}
       class="pb-3 border-b border-base-300"
     >
-      <span class="text-base-content/60 text-xs block mb-2">Market Timeframe</span>
+      <span class="text-base-content/60 text-xs block mb-2">
+        Market Timeframes <span class="text-base-content/40">(select multiple)</span>
+      </span>
       <div class="grid grid-cols-4 gap-1">
         <label
           :for={{key, preset} <- DeltaArb.Config.timeframe_presets()}
           class={[
             "px-2 py-1.5 rounded text-center text-xs font-medium cursor-pointer transition-colors",
-            Phoenix.HTML.Form.input_value(@form, :market_timeframe) == key &&
-              "bg-primary text-primary-content",
-            Phoenix.HTML.Form.input_value(@form, :market_timeframe) != key &&
-              "bg-base-200 hover:bg-base-300"
+            timeframe_checked?(@form, key) && "bg-primary text-primary-content",
+            not timeframe_checked?(@form, key) && "bg-base-200 hover:bg-base-300"
           ]}
         >
           <input
-            type="radio"
-            name={@form[:market_timeframe].name}
-            value={key}
-            checked={Phoenix.HTML.Form.input_value(@form, :market_timeframe) == key}
+            type="checkbox"
+            name={"#{@form[:market_timeframes].name}[#{key}]"}
+            value="true"
+            checked={timeframe_checked?(@form, key)}
             class="hidden"
           />
           {preset.label}
@@ -375,4 +375,27 @@ defmodule PolyxWeb.Components.Strategies.ConfigForm do
 
   defp format_spread_pct(spread) when is_number(spread), do: "#{Float.round(spread * 100, 1)}%"
   defp format_spread_pct(_), do: "?%"
+
+  # Check if a timeframe is selected (for checkbox multi-select)
+  defp timeframe_checked?(form, timeframe) do
+    value = Phoenix.HTML.Form.input_value(form, :market_timeframes)
+
+    cond do
+      # Map from checkbox input: %{"15m" => "true", "1h" => "true"}
+      is_map(value) ->
+        Map.get(value, timeframe) == "true" || Map.get(value, timeframe) == true
+
+      # Comma-separated string from database
+      is_binary(value) ->
+        timeframe in DeltaArb.Config.parse_timeframes(value)
+
+      # List
+      is_list(value) ->
+        timeframe in value
+
+      # Default - check if it's the default "15m"
+      true ->
+        timeframe == "15m"
+    end
+  end
 end
