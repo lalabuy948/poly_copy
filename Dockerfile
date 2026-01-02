@@ -64,7 +64,7 @@ RUN mix assets.deploy
 COPY config/runtime.exs config/
 
 COPY rel rel
-RUN mix release
+RUN mix release polyx
 
 # start a new build stage so that the final image will only contain
 # the compiled release and other runtime necessities
@@ -83,7 +83,7 @@ ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
 WORKDIR "/app"
-RUN chown nobody /app
+RUN mkdir -p /app/data && chown -R nobody:root /app
 
 # set runner ENV
 ENV MIX_ENV="prod"

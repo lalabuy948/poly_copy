@@ -6,14 +6,13 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "4000:4000"
+      - "4005:4005"
     environment:
       - PHX_SERVER=true
       - DATABASE_PATH=/app/data/polyx.db
-      - PORT=4000
+      - PORT=4005
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
     volumes:
-      - polyx_data:/app/data
+      - ./data:/app/data
     restart: unless-stopped
-
-volumes:
-  polyx_data:
