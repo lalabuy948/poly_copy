@@ -339,17 +339,6 @@ defmodule PolyxWeb.Components.Strategies.ConfigForm do
         />
       </div>
       <div class="flex justify-between items-center">
-        <span class="text-base-content/60">Min Minutes</span>
-        <input
-          type="number"
-          name={@form[:min_minutes].name}
-          value={Phoenix.HTML.Form.input_value(@form, :min_minutes)}
-          step="0.5"
-          min="0"
-          class="w-16 px-2 py-1 text-right font-medium rounded border border-base-300 bg-base-200 text-sm"
-        />
-      </div>
-      <div class="flex justify-between items-center col-span-2">
         <span class="text-base-content/60">Cooldown (s)</span>
         <input
           type="number"

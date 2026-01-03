@@ -40,9 +40,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
     # Maximum number of times to enter the same event
     field :max_entries_per_event, :integer, default: 3
 
-    # Minimum minutes before resolution to trade
-    field :min_minutes, :float, default: 1.0
-
     # Cooldown between trades on same market (seconds)
     field :cooldown_seconds, :integer, default: 60
   end
@@ -82,7 +79,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
       :min_spread,
       :order_size,
       :max_entries_per_event,
-      :min_minutes,
       :cooldown_seconds
     ])
     |> validate_inclusion(:market_type, @market_types)
@@ -176,7 +172,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
           :min_spread,
           :order_size,
           :max_entries_per_event,
-          :min_minutes,
           :cooldown_seconds
         ]
       end)
@@ -222,7 +217,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
 
     # Use the most aggressive (smallest) timeframe for defaults
     primary_timeframe = List.first(timeframes) || "15m"
-    preset = Map.get(@timeframe_presets, primary_timeframe, @timeframe_presets["15m"])
 
     # Calculate max_minutes based on largest selected timeframe
     max_minutes =
@@ -232,9 +226,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
       end)
       |> Enum.max(fn -> 15 end)
 
-    # Use custom min_minutes if set, otherwise use preset default
-    min_minutes = config.min_minutes || preset.min_minutes
-
     defaults(primary_timeframe)
     |> Map.merge(%{
       "market_type" => config.market_type || "crypto",
@@ -243,8 +234,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
       "min_spread" => config.min_spread || 0.04,
       "order_size" => config.order_size || 10.0,
       "max_entries_per_event" => config.max_entries_per_event || 3,
-      "min_minutes" => min_minutes,
-      "min_minutes_to_resolution" => 1,
       "cooldown_seconds" => config.cooldown_seconds || 60
     })
     |> Enum.map(fn {k, v} -> {to_string(k), v} end)
@@ -261,7 +250,6 @@ defmodule Polyx.Strategies.DeltaArb.Config do
       "min_spread" => config.min_spread,
       "order_size" => config.order_size,
       "max_entries_per_event" => config.max_entries_per_event,
-      "min_minutes" => config.min_minutes,
       "cooldown_seconds" => config.cooldown_seconds
     }
   end

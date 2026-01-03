@@ -423,26 +423,17 @@ defmodule Polyx.Strategies.DeltaArb do
       combined_cost = Helpers.calculate_combined_cost(ask_a, ask_b)
       spread = Helpers.calculate_spread(combined_cost)
       min_spread = config["min_spread"] || 0.04
-      min_minutes = config["min_minutes"] || config["min_minutes_to_resolution"] || 1
       order_size = config["order_size"] || 10.0
       cooldown_seconds = config["cooldown_seconds"] || 60
-
-      minutes_to_resolution = Helpers.calculate_minutes_to_resolution(market_info[:end_date])
 
       # Log significant spreads (> 2%)
       if spread >= 0.02 do
         Logger.info(
-          "[DeltaArb] 📊 Spread check: #{market_info[:question]} | spread=#{Float.round(spread * 100, 2)}% | combined=$#{Float.round(combined_cost, 3)} | min_spread=#{min_spread * 100}% | mins_left=#{Float.round(minutes_to_resolution, 1)}"
+          "[DeltaArb] 📊 Spread check: #{market_info[:question]} | spread=#{Float.round(spread * 100, 2)}% | combined=$#{Float.round(combined_cost, 3)} | min_spread=#{min_spread * 100}%"
         )
       end
 
-      valid? =
-        Helpers.is_valid_arb_opportunity?(
-          combined_cost,
-          min_spread,
-          min_minutes,
-          minutes_to_resolution
-        )
+      valid? = Helpers.is_valid_arb_opportunity?(combined_cost, min_spread)
 
       if valid? do
         Logger.info("[DeltaArb] ✅ Valid arb opportunity! Generating signals...")

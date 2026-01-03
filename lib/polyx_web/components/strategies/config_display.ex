@@ -124,10 +124,6 @@ defmodule PolyxWeb.Components.Strategies.ConfigDisplay do
         <span class="font-medium">{@config["max_entries_per_event"] || 3}</span>
       </div>
       <div class="flex justify-between items-center">
-        <span class="text-base-content/60">Min Minutes</span>
-        <span class="font-medium">{@config["min_minutes"] || 1}</span>
-      </div>
-      <div class="flex justify-between items-center col-span-2">
         <span class="text-base-content/60">Cooldown</span>
         <span class="font-medium">{@config["cooldown_seconds"] || 60}s</span>
       </div>

@@ -29,7 +29,8 @@ defmodule PolyxWeb.StrategiesLive.PriceHandler do
               best_bid: existing[:best_bid] || info[:best_bid],
               best_ask: existing[:best_ask] || info[:best_ask],
               mid: existing[:mid] || PriceUtils.calculate_mid(info[:best_bid], info[:best_ask]),
-              market_question: info[:market_question] || existing[:market_question] || "Loading...",
+              market_question:
+                info[:market_question] || existing[:market_question] || "Loading...",
               event_title: info[:event_title] || existing[:event_title],
               outcome: info[:outcome] || existing[:outcome],
               end_date: info[:end_date] || existing[:end_date]

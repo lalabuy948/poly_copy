@@ -88,16 +88,14 @@ defmodule Polyx.Strategies.DeltaArb.Helpers do
 
   @doc """
   Check if an arbitrage opportunity is valid.
+  For arb strategy, we don't need min_minutes - we trade any time as long as spread is good.
   """
-  def is_valid_arb_opportunity?(combined_cost, min_spread, min_minutes, minutes_to_resolution) do
+  def is_valid_arb_opportunity?(combined_cost, min_spread) do
     spread = calculate_spread(combined_cost)
 
     cond do
       is_nil(spread) -> false
       spread < min_spread -> false
-      is_nil(minutes_to_resolution) -> false
-      minutes_to_resolution <= 0 -> false
-      minutes_to_resolution < min_minutes -> false
       # Max combined cost check (must be less than $1.00)
       combined_cost >= 1.0 -> false
       true -> true
