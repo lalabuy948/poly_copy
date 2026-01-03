@@ -352,6 +352,7 @@ defmodule Polyx.Strategies.DeltaArb do
     # Check for arbitrage opportunity
     case check_arb_opportunity(state, asset_id) do
       {:opportunity, signals, updated_state} ->
+        Logger.info("[DeltaArb] 🚀 OPPORTUNITY FOUND! Returning #{length(signals)} signals")
         {:ok, updated_state, signals}
 
       :no_opportunity ->
@@ -370,6 +371,13 @@ defmodule Polyx.Strategies.DeltaArb do
     market_info = Map.get(state.market_cache, asset_id)
 
     if is_nil(market_info) do
+      # Log occasionally for debugging (not every tick)
+      if rem(System.system_time(:second), 30) == 0 do
+        Logger.debug(
+          "[DeltaArb] No market_info in cache for token #{String.slice(asset_id, 0, 12)}..."
+        )
+      end
+
       :no_opportunity
     else
       opposite_token_id = market_info[:opposite_token_id]
@@ -382,19 +390,23 @@ defmodule Polyx.Strategies.DeltaArb do
       cond do
         # Need prices for both tokens
         is_nil(this_price) or is_nil(opposite_price) ->
+          # Log why we're missing prices (occasionally)
+          if rem(System.system_time(:second), 30) == 0 do
+            Logger.debug(
+              "[DeltaArb] Missing price for pair: this=#{!is_nil(this_price)}, opposite=#{!is_nil(opposite_price)} | question=#{String.slice(market_info[:question] || "", 0, 40)}"
+            )
+          end
+
           :no_opportunity
 
-        # Check cooldown for either token
+        # Check cooldown for either token (prevents rapid re-entry)
         in_cooldown?(state, asset_id) or in_cooldown?(state, opposite_token_id) ->
+          Logger.debug("[DeltaArb] Token in cooldown: #{String.slice(asset_id, 0, 12)}...")
           :no_opportunity
 
-        # Check if already placed on this market
-        Map.has_key?(state.placed_orders, asset_id) or
-            Map.has_key?(state.placed_orders, opposite_token_id) ->
-          :no_opportunity
-
-        # Check max entries per event
+        # Check max entries per event (limits total entries per market)
         Map.get(state.event_entries, event_id, 0) >= config["max_entries_per_event"] ->
+          Logger.debug("[DeltaArb] Max entries reached for event: #{event_id}")
           :no_opportunity
 
         true ->
@@ -426,14 +438,14 @@ defmodule Polyx.Strategies.DeltaArb do
       order_size = config["order_size"] || 10.0
       cooldown_seconds = config["cooldown_seconds"] || 60
 
-      # Log significant spreads (> 2%)
+      valid? = Helpers.is_valid_arb_opportunity?(combined_cost, min_spread)
+
+      # Log significant spreads (> 2%) with full details
       if spread >= 0.02 do
         Logger.info(
-          "[DeltaArb] 📊 Spread check: #{market_info[:question]} | spread=#{Float.round(spread * 100, 2)}% | combined=$#{Float.round(combined_cost, 3)} | min_spread=#{min_spread * 100}%"
+          "[DeltaArb] 📊 Spread: #{market_info[:question]} | spread=#{Float.round(spread * 100, 2)}% | combined=$#{Float.round(combined_cost, 3)} | min=#{min_spread * 100}% | valid?=#{valid?} | asks=#{ask_a}/#{ask_b}"
         )
       end
-
-      valid? = Helpers.is_valid_arb_opportunity?(combined_cost, min_spread)
 
       if valid? do
         Logger.info("[DeltaArb] ✅ Valid arb opportunity! Generating signals...")
@@ -471,15 +483,32 @@ defmodule Polyx.Strategies.DeltaArb do
     # Calculate profit details
     profit_info = Helpers.calculate_guaranteed_profit(combined_cost, order_size)
 
-    if is_nil(profit_info) or profit_info.net_profit < 0.01 do
-      :no_opportunity
-    else
-      # Calculate shares (equal on both sides)
-      shares = profit_info.shares / 2
-
-      if shares < @min_shares or order_size < @min_order_value do
+    cond do
+      is_nil(profit_info) ->
+        Logger.warning("[DeltaArb] Profit calculation returned nil for combined=#{combined_cost}")
         :no_opportunity
-      else
+
+      profit_info.net_profit < 0.01 ->
+        Logger.info(
+          "[DeltaArb] Net profit too low: $#{Float.round(profit_info.net_profit, 4)} < $0.01"
+        )
+
+        :no_opportunity
+
+      profit_info.shares / 2 < @min_shares ->
+        Logger.info(
+          "[DeltaArb] Shares too low: #{Float.round(profit_info.shares / 2, 2)} < #{@min_shares}"
+        )
+
+        :no_opportunity
+
+      order_size < @min_order_value ->
+        Logger.info("[DeltaArb] Order size too low: $#{order_size} < $#{@min_order_value}")
+        :no_opportunity
+
+      true ->
+        # All checks passed, generate signals
+        shares = profit_info.shares / 2
         event_id = market_info[:event_id]
         outcome_a = market_info[:outcome]
 
@@ -570,7 +599,6 @@ defmodule Polyx.Strategies.DeltaArb do
         }
 
         {:opportunity, [signal_yes, signal_no], updated_state}
-      end
     end
   end
 

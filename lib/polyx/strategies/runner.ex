@@ -390,6 +390,36 @@ defmodule Polyx.Strategies.Runner do
           broadcast_price_update(strategy_id, token_id, price_data)
         end)
 
+        # CRITICAL: Feed initial prices into strategy state for arb evaluation
+        # This ensures the strategy has prices before WebSocket updates arrive
+        strategy_state =
+          Enum.reduce(seeded_prices, strategy_state, fn {token_id, price_data}, st ->
+            # Update strategy's internal prices map
+            current_prices = Map.get(st, :prices, %{})
+
+            updated_prices =
+              Map.put(current_prices, token_id, %{
+                best_bid: price_data[:best_bid],
+                best_ask: price_data[:best_ask],
+                updated_at: System.system_time(:millisecond)
+              })
+
+            Map.put(st, :prices, updated_prices)
+          end)
+
+        # Check for arb opportunities on seeded prices
+        # This triggers the strategy to evaluate all newly fetched pairs
+        {strategy_state, signals} =
+          check_initial_arb_opportunities(runner_state.module, strategy_state, seeded_prices)
+
+        if signals != [] do
+          Logger.info(
+            "[Runner] 🎯 Found #{length(signals)} arb opportunities from initial prices!"
+          )
+
+          execute_signals(runner_state.strategy, signals)
+        end
+
         # Broadcast new tokens to UI (with market info, prices will come via WS)
         tokens_with_info =
           Enum.map(added, fn token_id -> {token_id, new_discovered_tokens[token_id]} end)
@@ -400,7 +430,8 @@ defmodule Polyx.Strategies.Runner do
           {:discovered_tokens, tokens_with_info}
         )
 
-        {%{runner_state | token_prices: merged_prices}, new_discovered_tokens}
+        {%{runner_state | token_prices: merged_prices, state: strategy_state},
+         new_discovered_tokens}
       else
         {runner_state, new_discovered_tokens}
       end
@@ -913,4 +944,43 @@ defmodule Polyx.Strategies.Runner do
 
   defp config_module_for_type("delta_arb"), do: Polyx.Strategies.DeltaArb.Config
   defp config_module_for_type(_), do: Polyx.Strategies.Config
+
+  # Check for arb opportunities on initial seeded prices
+  # Simulates price_change events for each token to trigger arb evaluation
+  defp check_initial_arb_opportunities(module, strategy_state, seeded_prices) do
+    token_ids = Map.keys(seeded_prices)
+
+    Logger.info(
+      "[Runner] Checking #{length(token_ids)} tokens for arb opportunities after initial price fetch"
+    )
+
+    # Process each token as if it received a price update
+    {final_state, all_signals} =
+      Enum.reduce(token_ids, {strategy_state, []}, fn token_id, {state, signals_acc} ->
+        price_data = Map.get(seeded_prices, token_id)
+
+        order = %{
+          event_type: "price_change",
+          asset_id: token_id,
+          best_bid: price_data[:best_bid],
+          best_ask: price_data[:best_ask]
+        }
+
+        case module.handle_order(order, state) do
+          {:ok, new_state, new_signals} when is_list(new_signals) and new_signals != [] ->
+            {new_state, signals_acc ++ new_signals}
+
+          {:ok, new_state} ->
+            {new_state, signals_acc}
+
+          {:ok, new_state, []} ->
+            {new_state, signals_acc}
+
+          _ ->
+            {state, signals_acc}
+        end
+      end)
+
+    {final_state, all_signals}
+  end
 end
