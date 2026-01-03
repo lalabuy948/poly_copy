@@ -22,7 +22,8 @@ defmodule PolyxWeb.StrategiesLive do
     StrategyList,
     StrategyDetails,
     LiveSignals,
-    WatchedTokens
+    WatchedTokens,
+    ArbPairs
   }
 
   require Logger
@@ -204,31 +205,20 @@ defmodule PolyxWeb.StrategiesLive do
       )
     end
 
-    # Subscribe to new
-    Phoenix.PubSub.subscribe(Polyx.PubSub, "strategies:#{id}")
-
     # Enrich with actual running state
     is_running = Engine.running?(id)
     enriched = %{strategy | status: if(is_running, do: "running", else: "stopped")}
 
-    # Load trades
-    trades = Strategies.list_trades(id, limit: 50)
-    paper_orders = Enum.map(trades, &State.trade_to_paper_order/1)
+    # Use State.subscribe_to_strategy which fetches tokens synchronously
+    # This avoids the flash of empty state
+    socket =
+      socket
+      |> assign(:selected_strategy, %{strategy: enriched, stats: stats})
+      |> State.subscribe_to_strategy(id)
+      |> stream(:events, events, reset: true)
+      |> stream(:live_orders, [], reset: true)
 
-    # Request discovered tokens if running
-    if is_running do
-      send(self(), {:fetch_discovered_tokens, id})
-    end
-
-    {:noreply,
-     socket
-     |> assign(:selected_strategy, %{strategy: enriched, stats: stats})
-     |> assign(:token_prices, %{})
-     |> assign(:discovery_retries, 0)
-     |> assign(:paper_orders, paper_orders)
-     |> stream(:events, events, reset: true)
-     |> stream(:live_orders, [], reset: true)
-     |> push_patch(to: ~p"/strategies/#{id}")}
+    {:noreply, push_patch(socket, to: ~p"/strategies/#{id}")}
   end
 
   @impl true
@@ -302,9 +292,10 @@ defmodule PolyxWeb.StrategiesLive do
 
   @impl true
   def handle_event("edit_config", _params, socket) do
-    config_map = socket.assigns.selected_strategy.strategy.config
-    config = Config.from_map(config_map)
-    changeset = Config.changeset(config, %{})
+    strategy = socket.assigns.selected_strategy.strategy
+    config_mod = config_module_for_type(strategy.type)
+    config = config_mod.from_map(strategy.config)
+    changeset = config_mod.changeset(config, %{})
     form = to_form(changeset, as: :config)
     {:noreply, socket |> assign(:editing_config, true) |> assign(:config_form, form)}
   end
@@ -316,12 +307,13 @@ defmodule PolyxWeb.StrategiesLive do
 
   @impl true
   def handle_event("validate_config", %{"config" => config_params}, socket) do
-    config_map = socket.assigns.selected_strategy.strategy.config
-    config = Config.from_map(config_map)
+    strategy = socket.assigns.selected_strategy.strategy
+    config_mod = config_module_for_type(strategy.type)
+    config = config_mod.from_map(strategy.config)
 
     changeset =
       config
-      |> Config.changeset(config_params)
+      |> config_mod.changeset(config_params)
       |> Map.put(:action, :validate)
 
     {:noreply, assign(socket, :config_form, to_form(changeset, as: :config))}
@@ -330,13 +322,13 @@ defmodule PolyxWeb.StrategiesLive do
   @impl true
   def handle_event("save_config", %{"config" => config_params}, socket) do
     strategy = socket.assigns.selected_strategy.strategy
-    config_map = strategy.config
-    config = Config.from_map(config_map)
-    changeset = Config.changeset(config, config_params)
+    config_mod = config_module_for_type(strategy.type)
+    config = config_mod.from_map(strategy.config)
+    changeset = config_mod.changeset(config, config_params)
 
     if changeset.valid? do
       updated_config = Ecto.Changeset.apply_changes(changeset)
-      new_config_map = Config.to_map(updated_config)
+      new_config_map = config_mod.to_map(updated_config)
 
       case Strategies.update_strategy(strategy, %{config: new_config_map}) do
         {:ok, updated} ->
@@ -362,6 +354,9 @@ defmodule PolyxWeb.StrategiesLive do
       {:noreply, assign(socket, :config_form, to_form(changeset, as: :config))}
     end
   end
+
+  defp config_module_for_type("delta_arb"), do: Polyx.Strategies.DeltaArb.Config
+  defp config_module_for_type(_), do: Config
 
   # Message handlers
 
@@ -528,10 +523,17 @@ defmodule PolyxWeb.StrategiesLive do
 
               <%= if @selected_strategy && @selected_strategy.strategy.status == "running" do %>
                 <.live_signals streams={@streams} />
-                <.watched_tokens
-                  token_prices={@token_prices}
-                  config={@selected_strategy.strategy.config}
-                />
+                <%= if @selected_strategy.strategy.type == "delta_arb" do %>
+                  <.arb_pairs
+                    token_prices={@token_prices}
+                    config={@selected_strategy.strategy.config}
+                  />
+                <% else %>
+                  <.watched_tokens
+                    token_prices={@token_prices}
+                    config={@selected_strategy.strategy.config}
+                  />
+                <% end %>
               <% end %>
             </div>
 

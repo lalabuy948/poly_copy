@@ -80,6 +80,7 @@ defmodule Polyx.Strategies.Behaviour do
   def module_for_type(type) do
     case type do
       "time_decay" -> {:ok, Polyx.Strategies.TimeDecay}
+      "delta_arb" -> {:ok, Polyx.Strategies.DeltaArb}
       _ -> {:error, "Unknown strategy type: #{type}"}
     end
   end
@@ -96,6 +97,31 @@ defmodule Polyx.Strategies.Behaviour do
   """
   def default_config(type) do
     case type do
+      "delta_arb" ->
+        %{
+          # Market type: "crypto", "sports", or "all"
+          "market_type" => "crypto",
+          # Market timeframe
+          "market_timeframe" => "15m",
+          # Minimum spread to enter (4% = $0.04 guaranteed profit per $1)
+          "min_spread" => 0.04,
+          # Order size in USD per leg (total = 2x)
+          "order_size" => 10,
+          # Maximum entries per event
+          "max_entries_per_event" => 3,
+          # Minimum minutes before resolution
+          "min_minutes" => 1,
+          # Cooldown between trades on same market (seconds)
+          "cooldown_seconds" => 60,
+          # Auto-discover markets
+          "auto_discover" => true,
+          # Discovery interval
+          "discovery_interval_seconds" => 30,
+          # Target tokens (empty for auto-discovery)
+          "target_tokens" => [],
+          "watch_all" => false
+        }
+
       "time_decay" ->
         %{
           # Target price when current price > high_threshold
@@ -193,6 +219,7 @@ defmodule Polyx.Strategies.Behaviour do
   def display_name(type) do
     case type do
       "time_decay" -> "Time Decay"
+      "delta_arb" -> "Delta Arb"
       _ -> type
     end
   end
@@ -202,7 +229,8 @@ defmodule Polyx.Strategies.Behaviour do
   """
   def available_types do
     [
-      {"time_decay", "Time Decay", "Capture final price movement near event resolution"}
+      {"time_decay", "Time Decay", "Capture final price movement near event resolution"},
+      {"delta_arb", "Delta Arb", "Risk-free arbitrage by buying both sides below $1.00"}
     ]
   end
 
@@ -214,6 +242,14 @@ defmodule Polyx.Strategies.Behaviour do
       "time_decay" ->
         [
           {"crypto_15min", "15-Min Crypto", "Auto-discover and trade 15-minute crypto markets"}
+        ]
+
+      "delta_arb" ->
+        [
+          {"crypto_15min", "15-Min Crypto Arb",
+           "Arbitrage on 15-minute crypto prediction markets"},
+          {"crypto_1h", "1-Hour Crypto Arb", "Arbitrage on hourly crypto prediction markets"},
+          {"sports", "Sports Arb", "Arbitrage on sports betting markets"}
         ]
 
       _ ->

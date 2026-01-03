@@ -270,6 +270,52 @@ defmodule Polyx.Polymarket.Gamma do
   end
 
   @doc """
+  Fetch sports markets ending within the specified time window.
+  Filters by sports-related keywords in the event title.
+
+  Options:
+    - :max_minutes - Maximum minutes until resolution (default: 120)
+    - :min_minutes - Minimum minutes until resolution (default: 1)
+    - :limit - Number of events to fetch (default: 50)
+  """
+  def fetch_sports_markets_ending_soon(opts \\ []) do
+    with :ok <- RateLimiter.acquire(:gamma) do
+      RetryHandler.with_retry(
+        fn -> do_fetch_sports_markets(opts) end,
+        context: "fetch_sports_markets_ending_soon"
+      )
+    end
+  end
+
+  defp do_fetch_sports_markets(opts) do
+    max_minutes = Keyword.get(opts, :max_minutes, 120)
+    min_minutes = Keyword.get(opts, :min_minutes, 1)
+    limit = Keyword.get(opts, :limit, 50)
+
+    params = [
+      closed: false,
+      active: true,
+      limit: limit,
+      order: "volume24hr",
+      ascending: false
+    ]
+
+    url = "#{@base_url}/events?#{URI.encode_query(params)}"
+    response = Req.get(url, @req_options)
+
+    RetryHandler.handle_response(response, fn body ->
+      filtered_events =
+        body
+        |> Enum.filter(&(&1["enableOrderBook"] == true))
+        |> Enum.filter(&Filter.is_sports_event?/1)
+        |> Filter.filter_by_time_window(min_minutes, max_minutes)
+        |> Enum.map(&Parser.parse_event/1)
+
+      {:ok, filtered_events}
+    end)
+  end
+
+  @doc """
   Search events using the search API.
   """
   def search_events(query, opts \\ []) do

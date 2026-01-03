@@ -3,8 +3,6 @@ defmodule PolyxWeb.Plugs.OptionalBasicAuth do
   Optional basic authentication plug that checks config at runtime.
   """
 
-  import Plug.Conn
-
   def init(opts), do: opts
 
   def call(conn, _opts) do

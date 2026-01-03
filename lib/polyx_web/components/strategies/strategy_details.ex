@@ -79,9 +79,12 @@ defmodule PolyxWeb.Components.Strategies.StrategyDetails do
           </div>
 
           <%= if @editing_config do %>
-            <.config_form form={@config_form} />
+            <.config_form form={@config_form} strategy_type={@selected_strategy.strategy.type} />
           <% else %>
-            <.config_display config={@selected_strategy.strategy.config} />
+            <.config_display
+              config={@selected_strategy.strategy.config}
+              strategy_type={@selected_strategy.strategy.type}
+            />
           <% end %>
         </div>
 

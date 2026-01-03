@@ -27,6 +27,40 @@ defmodule Polyx.Polymarket.Gamma.Filter do
     "uni"
   ]
 
+  @sports_keywords [
+    "nfl",
+    "nba",
+    "mlb",
+    "nhl",
+    "soccer",
+    "football",
+    "basketball",
+    "baseball",
+    "hockey",
+    "championship",
+    "super bowl",
+    "world series",
+    "playoffs",
+    "game",
+    "match",
+    "vs",
+    "versus",
+    "win",
+    "score",
+    "team",
+    "league",
+    "premier league",
+    "champions league",
+    "ufc",
+    "mma",
+    "boxing",
+    "tennis",
+    "golf",
+    "f1",
+    "formula 1",
+    "nascar"
+  ]
+
   @doc """
   Check if an event is crypto-related based on title, description, and tags.
   """
@@ -53,6 +87,33 @@ defmodule Polyx.Polymarket.Gamma.Filter do
   end
 
   def is_crypto_event?(_), do: false
+
+  @doc """
+  Check if an event is sports-related based on title, description, and tags.
+  """
+  def is_sports_event?(event) when is_map(event) do
+    title = String.downcase(event["title"] || "")
+    desc = String.downcase(event["description"] || "")
+
+    # Check title first (most reliable)
+    title_match = Enum.any?(@sports_keywords, &String.contains?(title, &1))
+
+    # Check tags if available
+    tags = event["tags"] || []
+
+    tag_match =
+      Enum.any?(tags, fn tag ->
+        label = String.downcase(tag["label"] || "")
+        label == "sports" or String.contains?(label, "sports")
+      end)
+
+    # Check description as fallback
+    desc_match = Enum.any?(@sports_keywords, &String.contains?(desc, &1))
+
+    title_match or tag_match or desc_match
+  end
+
+  def is_sports_event?(_), do: false
 
   @doc """
   Filter events by search query (searches in title and description).
