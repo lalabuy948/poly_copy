@@ -359,7 +359,7 @@ defmodule Polyx.Strategies.Runner do
       end)
 
     # Handle added tokens
-    {runner_state, new_discovered_tokens} =
+    {runner_state, new_discovered_tokens, updated_strategy_state} =
       if added != [] do
         Logger.info("[Runner] Discovered #{length(added)} new tokens, subscribing to WebSocket")
 
@@ -392,7 +392,7 @@ defmodule Polyx.Strategies.Runner do
 
         # CRITICAL: Feed initial prices into strategy state for arb evaluation
         # This ensures the strategy has prices before WebSocket updates arrive
-        strategy_state =
+        updated_strat_state =
           Enum.reduce(seeded_prices, strategy_state, fn {token_id, price_data}, st ->
             # Update strategy's internal prices map
             current_prices = Map.get(st, :prices, %{})
@@ -409,8 +409,8 @@ defmodule Polyx.Strategies.Runner do
 
         # Check for arb opportunities on seeded prices
         # This triggers the strategy to evaluate all newly fetched pairs
-        {strategy_state, signals} =
-          check_initial_arb_opportunities(runner_state.module, strategy_state, seeded_prices)
+        {final_strat_state, signals} =
+          check_initial_arb_opportunities(runner_state.module, updated_strat_state, seeded_prices)
 
         if signals != [] do
           Logger.info(
@@ -430,10 +430,9 @@ defmodule Polyx.Strategies.Runner do
           {:discovered_tokens, tokens_with_info}
         )
 
-        {%{runner_state | token_prices: merged_prices, state: strategy_state},
-         new_discovered_tokens}
+        {%{runner_state | token_prices: merged_prices}, new_discovered_tokens, final_strat_state}
       else
-        {runner_state, new_discovered_tokens}
+        {runner_state, new_discovered_tokens, strategy_state}
       end
 
     # Handle removed tokens
@@ -451,7 +450,8 @@ defmodule Polyx.Strategies.Runner do
     # Log current state
     Logger.info("[Runner] Token sync complete: #{length(new_token_ids)} active tokens")
 
-    %{runner_state | state: strategy_state, discovered_tokens: new_discovered_tokens}
+    # Return the updated runner_state with strategy state and discovered_tokens
+    %{runner_state | state: updated_strategy_state, discovered_tokens: new_discovered_tokens}
   end
 
   defp prime_target_tokens(%__MODULE__{} = state) do

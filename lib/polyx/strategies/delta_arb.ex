@@ -339,6 +339,11 @@ defmodule Polyx.Strategies.DeltaArb do
     best_bid = Helpers.parse_price(order.best_bid)
     best_ask = Helpers.parse_price(order.best_ask)
 
+    # Log price updates for debugging
+    Logger.debug(
+      "[DeltaArb] Price update: #{String.slice(asset_id, 0, 12)}... bid=#{best_bid} ask=#{best_ask} | prices_count=#{map_size(state.prices)} cache_count=#{map_size(state.market_cache)}"
+    )
+
     # Update prices
     prices =
       Map.put(state.prices, asset_id, %{
@@ -371,12 +376,10 @@ defmodule Polyx.Strategies.DeltaArb do
     market_info = Map.get(state.market_cache, asset_id)
 
     if is_nil(market_info) do
-      # Log occasionally for debugging (not every tick)
-      if rem(System.system_time(:second), 30) == 0 do
-        Logger.debug(
-          "[DeltaArb] No market_info in cache for token #{String.slice(asset_id, 0, 12)}..."
-        )
-      end
+      # Log for debugging
+      Logger.warning(
+        "[DeltaArb] No market_info in cache for token #{String.slice(asset_id, 0, 12)}... | cache_size=#{map_size(state.market_cache)}"
+      )
 
       :no_opportunity
     else
@@ -390,12 +393,10 @@ defmodule Polyx.Strategies.DeltaArb do
       cond do
         # Need prices for both tokens
         is_nil(this_price) or is_nil(opposite_price) ->
-          # Log why we're missing prices (occasionally)
-          if rem(System.system_time(:second), 30) == 0 do
-            Logger.debug(
-              "[DeltaArb] Missing price for pair: this=#{!is_nil(this_price)}, opposite=#{!is_nil(opposite_price)} | question=#{String.slice(market_info[:question] || "", 0, 40)}"
-            )
-          end
+          # Log why we're missing prices
+          Logger.debug(
+            "[DeltaArb] Missing price for pair: this=#{!is_nil(this_price)}, opposite=#{!is_nil(opposite_price)} | question=#{String.slice(market_info[:question] || "", 0, 40)}"
+          )
 
           :no_opportunity
 
