@@ -104,10 +104,10 @@ defmodule Polyx.Strategies.Runner do
     case Behaviour.module_for_type(strategy.type) do
       {:ok, module} ->
         # Convert raw config to full strategy config with timeframe defaults
-        full_config = convert_config(strategy.config)
+        full_config = convert_config(strategy.config, strategy.type)
 
         Logger.info(
-          "[Runner] Module: #{module}, timeframe: #{full_config["market_timeframe"]}, max_minutes: #{full_config["max_minutes_to_resolution"]}"
+          "[Runner] Module: #{module}, type: #{full_config["market_type"]}, timeframe: #{full_config["market_timeframe"]}, max_minutes: #{full_config["max_minutes_to_resolution"]}"
         )
 
         case module.init(full_config) do
@@ -359,12 +359,14 @@ defmodule Polyx.Strategies.Runner do
       end)
 
     # Handle added tokens
-    {runner_state, new_discovered_tokens} =
+    {runner_state, new_discovered_tokens, updated_strategy_state} =
       if added != [] do
         Logger.info("[Runner] Discovered #{length(added)} new tokens, subscribing to WebSocket")
 
-        # Log each token being subscribed
-        Enum.each(added, fn token_id ->
+        # Only log first 10 tokens to avoid log spam
+        added
+        |> Enum.take(10)
+        |> Enum.each(fn token_id ->
           token_info = new_discovered_tokens[token_id]
 
           Logger.info(
@@ -372,17 +374,53 @@ defmodule Polyx.Strategies.Runner do
           )
         end)
 
+        if length(added) > 10 do
+          Logger.info("[Runner]   → ... and #{length(added) - 10} more tokens")
+        end
+
         LiveOrders.subscribe_to_markets(added)
 
-        # Seed initial prices from orderbooks so UI shows bid/ask before WS ticks arrive
-        seeded_prices = fetch_initial_prices(added, new_discovered_tokens)
+        # Seed initial prices for first batch only (limit to avoid timeout with many tokens)
+        # WebSocket will fill in the rest as prices update
+        tokens_to_fetch = Enum.take(added, 50)
+        seeded_prices = fetch_initial_prices(tokens_to_fetch, new_discovered_tokens)
         merged_prices = Map.merge(runner_state.token_prices, seeded_prices)
 
         Enum.each(seeded_prices, fn {token_id, price_data} ->
           broadcast_price_update(strategy_id, token_id, price_data)
         end)
 
-        # Broadcast new tokens to UI
+        # CRITICAL: Feed initial prices into strategy state for arb evaluation
+        # This ensures the strategy has prices before WebSocket updates arrive
+        updated_strat_state =
+          Enum.reduce(seeded_prices, strategy_state, fn {token_id, price_data}, st ->
+            # Update strategy's internal prices map
+            current_prices = Map.get(st, :prices, %{})
+
+            updated_prices =
+              Map.put(current_prices, token_id, %{
+                best_bid: price_data[:best_bid],
+                best_ask: price_data[:best_ask],
+                updated_at: System.system_time(:millisecond)
+              })
+
+            Map.put(st, :prices, updated_prices)
+          end)
+
+        # Check for arb opportunities on seeded prices
+        # This triggers the strategy to evaluate all newly fetched pairs
+        {final_strat_state, signals} =
+          check_initial_arb_opportunities(runner_state.module, updated_strat_state, seeded_prices)
+
+        if signals != [] do
+          Logger.info(
+            "[Runner] 🎯 Found #{length(signals)} arb opportunities from initial prices!"
+          )
+
+          execute_signals(runner_state.strategy, signals)
+        end
+
+        # Broadcast new tokens to UI (with market info, prices will come via WS)
         tokens_with_info =
           Enum.map(added, fn token_id -> {token_id, new_discovered_tokens[token_id]} end)
 
@@ -392,9 +430,9 @@ defmodule Polyx.Strategies.Runner do
           {:discovered_tokens, tokens_with_info}
         )
 
-        {%{runner_state | token_prices: merged_prices}, new_discovered_tokens}
+        {%{runner_state | token_prices: merged_prices}, new_discovered_tokens, final_strat_state}
       else
-        {runner_state, new_discovered_tokens}
+        {runner_state, new_discovered_tokens, strategy_state}
       end
 
     # Handle removed tokens
@@ -412,7 +450,8 @@ defmodule Polyx.Strategies.Runner do
     # Log current state
     Logger.info("[Runner] Token sync complete: #{length(new_token_ids)} active tokens")
 
-    %{runner_state | state: strategy_state, discovered_tokens: new_discovered_tokens}
+    # Return the updated runner_state with strategy state and discovered_tokens
+    %{runner_state | state: updated_strategy_state, discovered_tokens: new_discovered_tokens}
   end
 
   defp prime_target_tokens(%__MODULE__{} = state) do
@@ -731,8 +770,8 @@ defmodule Polyx.Strategies.Runner do
       fn token_id ->
         case Client.get_orderbook(token_id) do
           {:ok, %{"bids" => bids, "asks" => asks}} ->
-            best_bid = get_best_price(bids)
-            best_ask = get_best_price(asks)
+            best_bid = get_best_bid(bids)
+            best_ask = get_best_ask(asks)
             mid = PriceUtils.calculate_mid(best_bid, best_ask)
             info = Map.get(discovered_tokens, token_id, %{})
 
@@ -766,15 +805,35 @@ defmodule Polyx.Strategies.Runner do
     end)
   end
 
-  defp get_best_price([%{"price" => price} | _]) when is_binary(price) do
+  # Best bid = highest price someone is willing to buy at
+  defp get_best_bid(bids) when is_list(bids) and bids != [] do
+    bids
+    |> Enum.map(&parse_order_price/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max(fn -> nil end)
+  end
+
+  defp get_best_bid(_), do: nil
+
+  # Best ask = lowest price someone is willing to sell at
+  defp get_best_ask(asks) when is_list(asks) and asks != [] do
+    asks
+    |> Enum.map(&parse_order_price/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(fn -> nil end)
+  end
+
+  defp get_best_ask(_), do: nil
+
+  defp parse_order_price(%{"price" => price}) when is_binary(price) do
     case Float.parse(price) do
       {val, _} -> val
       :error -> nil
     end
   end
 
-  defp get_best_price([%{"price" => price} | _]) when is_number(price), do: price
-  defp get_best_price(_), do: nil
+  defp parse_order_price(%{"price" => price}) when is_number(price), do: price
+  defp parse_order_price(_), do: nil
 
   # Extract target tokens from strategy config
   defp extract_target_tokens(config) do
@@ -874,12 +933,54 @@ defmodule Polyx.Strategies.Runner do
   end
 
   # Convert raw database config to full strategy config with timeframe defaults
-  defp convert_config(config) when is_map(config) do
-    alias Polyx.Strategies.Config
+  defp convert_config(config, strategy_type) when is_map(config) do
+    config_module = config_module_for_type(strategy_type)
 
     # Convert to Config struct and then to full strategy config
     config
-    |> Config.from_map()
-    |> Config.to_strategy_config()
+    |> config_module.from_map()
+    |> config_module.to_strategy_config()
+  end
+
+  defp config_module_for_type("delta_arb"), do: Polyx.Strategies.DeltaArb.Config
+  defp config_module_for_type(_), do: Polyx.Strategies.Config
+
+  # Check for arb opportunities on initial seeded prices
+  # Simulates price_change events for each token to trigger arb evaluation
+  defp check_initial_arb_opportunities(module, strategy_state, seeded_prices) do
+    token_ids = Map.keys(seeded_prices)
+
+    Logger.info(
+      "[Runner] Checking #{length(token_ids)} tokens for arb opportunities after initial price fetch"
+    )
+
+    # Process each token as if it received a price update
+    {final_state, all_signals} =
+      Enum.reduce(token_ids, {strategy_state, []}, fn token_id, {state, signals_acc} ->
+        price_data = Map.get(seeded_prices, token_id)
+
+        order = %{
+          event_type: "price_change",
+          asset_id: token_id,
+          best_bid: price_data[:best_bid],
+          best_ask: price_data[:best_ask]
+        }
+
+        case module.handle_order(order, state) do
+          {:ok, new_state, new_signals} when is_list(new_signals) and new_signals != [] ->
+            {new_state, signals_acc ++ new_signals}
+
+          {:ok, new_state} ->
+            {new_state, signals_acc}
+
+          {:ok, new_state, []} ->
+            {new_state, signals_acc}
+
+          _ ->
+            {state, signals_acc}
+        end
+      end)
+
+    {final_state, all_signals}
   end
 end

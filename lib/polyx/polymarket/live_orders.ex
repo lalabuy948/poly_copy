@@ -355,8 +355,8 @@ defmodule Polyx.Polymarket.LiveOrders do
     bids = data["bids"] || []
     asks = data["asks"] || []
 
-    best_bid = get_best_price(bids)
-    best_ask = get_best_price(asks)
+    best_bid = get_best_bid(bids)
+    best_ask = get_best_ask(asks)
 
     if asset_id && (best_bid || best_ask) do
       market_info = lookup_market_info(asset_id)
@@ -391,15 +391,35 @@ defmodule Polyx.Polymarket.LiveOrders do
 
   # Helpers
 
-  defp get_best_price([%{"price" => price} | _]) when is_binary(price) do
+  # Best bid = highest price someone is willing to buy at
+  defp get_best_bid(bids) when is_list(bids) and bids != [] do
+    bids
+    |> Enum.map(&parse_order_price/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max(fn -> nil end)
+  end
+
+  defp get_best_bid(_), do: nil
+
+  # Best ask = lowest price someone is willing to sell at
+  defp get_best_ask(asks) when is_list(asks) and asks != [] do
+    asks
+    |> Enum.map(&parse_order_price/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(fn -> nil end)
+  end
+
+  defp get_best_ask(_), do: nil
+
+  defp parse_order_price(%{"price" => price}) when is_binary(price) do
     case Float.parse(price) do
       {val, _} -> val
       :error -> nil
     end
   end
 
-  defp get_best_price([%{"price" => price} | _]) when is_number(price), do: price
-  defp get_best_price(_), do: nil
+  defp parse_order_price(%{"price" => price}) when is_number(price), do: price
+  defp parse_order_price(_), do: nil
 
   defp normalize_asset_ids(asset_ids, state) do
     asset_ids
